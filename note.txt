@@ -1,0 +1,47 @@
+这一脚本应该可以将RDT的airbot h5数据集（由convert_data_to_rdt_h5.py创建）转为lerobot格式。HFID应为你的huggingface id，不过不上传的话无关紧要；DATASET为数据集名称。447条✕250帧✕2相机≈30min
+
+uv run examples/airbot/convert_airbot_data_to_lerobot.py --raw_dir datasets/pick_place --repo_id HFID/DATASET --no-push-to-hub
+uv run examples/airbot/convert_airbot_data_to_lerobot.py --raw_dir datasets/pick_place --repo_id destroy314/pick_place --no-push-to-hub
+
+转换后结构如下。尽管设置了use_videos: bool = True，图片仍是以png保存在parquet中的，导致每个文件有100MB。
+
+~/.cache/huggingface/lerobot/HFID/DATASET
+├── data
+│   ├── chunk-000
+│   │   ├── episode_000000.parquet
+│   │   ├── episode_000001.parquet
+│   │   ├── episode_000002.parquet
+│   │   └── ...
+│   └── ...
+└── meta
+    ├── episodes.jsonl
+    ├── info.json
+    ├── stats.json
+    └── tasks.jsonl
+
+计算统计信息：（≈20min）
+
+CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name CFGNAME
+CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name pi0_fast_airbot_pick_place_low_mem_finetune
+
+这会产生.assets/CFGNAME/HFID/DATASET/norm_stats.json，并在微调时使用。对于共享数据集的多个config，可以手动复制对应的统计信息。
+
+> 或者可以做些小修改来方便些
+> 修改compute_norm_stats.py L69为：
+> output_path = config.data.assets.assets_dir + "/" + data_config.repo_id
+> 在每个TrainConfig中的data的初始化参数中添加：
+> assets=AssetsConfig(assets_dir="assets"), # 注意没有点
+> 此时统计信息会产生在.assets/HFID/DATASET/norm_stats.json，可以方便的在多个config间共享
+
+微调：
+
+CUDA_VISIBLE_DEVICES=5 XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 uv run scripts/train.py pi0_fast_airbot_pick_place_low_mem_finetune --exp-name=pi0_fast_lora_absolute_airbot_pick_place --overwrite
+
+推理：
+
+uv run examples/simple_client/main.py --env ALOHA # test
+
+# in shell 1:
+openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_airbot_pick_place_low_mem_finetune --policy.dir=checkpoints/pi0_fast_airbot_pick_place_low_mem_finetune/pi0_fast_lora_airbot_pick_place
+# in shell 2:
+Imitate-All$ python pi0_evaluate_client.py
