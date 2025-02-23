@@ -1,9 +1,20 @@
 这一脚本应该可以将RDT的airbot h5数据集（由convert_data_to_rdt_h5.py创建）转为lerobot格式。HFID应为你的huggingface id，不过不上传的话无关紧要；DATASET为数据集名称。447条✕250帧✕2相机≈30min
 
 uv run examples/airbot/convert_airbot_data_to_lerobot.py --raw_dir datasets/pick_place --repo_id HFID/DATASET --no-push-to-hub
-uv run examples/airbot/convert_airbot_data_to_lerobot.py --raw_dir datasets/pick_place --repo_id destroy314/pick_place --no-push-to-hub
+uv run examples/airbot/convert_raw_airbot_data_to_lerobot.py --raw_dir datasets/raw --repo_id destroy314/airbot --no-push-to-hub
 
-转换后结构如下。尽管设置了use_videos: bool = True，图片仍是以png保存在parquet中的，导致每个文件有100MB。
+> TODO
+> raw->lerobot的转换脚本
+>
+> 接下来会涉及单/双臂数据混合训练
+> a. 正常保存并修改create_dataset使用MultiLeRobotDataset以混合不同数据集（以后还是用这个方案吧）
+> 或
+> b. 对单臂数据进行zero-padding，使其key与双臂保持一致，保存在同一个lerobot dataset里（pi0fast不需要设置image_masks，只用这个模型就没关系）（暂定这个方案）
+>
+> prompt最好不要写在数据集里，以便修改？写了也挺好改的
+> 现在写在了airbot_policy.py里
+
+转换后结构如下：
 
 ~/.cache/huggingface/lerobot/HFID/DATASET
 ├── data
@@ -13,13 +24,22 @@ uv run examples/airbot/convert_airbot_data_to_lerobot.py --raw_dir datasets/pick
 │   │   ├── episode_000002.parquet
 │   │   └── ...
 │   └── ...
-└── meta
-    ├── episodes.jsonl
-    ├── info.json
-    ├── stats.json
-    └── tasks.jsonl
+├── meta
+│   ├── episodes.jsonl
+│   ├── info.json
+│   ├── stats.json
+│   └── tasks.jsonl
+└── videos
+    ├── chunk-000
+    │   ├── observation.images.cam_high
+    │   │   ├── episode_000000.mp4
+    │   │   ├── episode_000001.mp4
+    │   │   ├── ...
+    │   ├── observation.images.cam_left_wrist
+    │   └── ...
+    └── ...
 
-计算统计信息：（≈20min）
+计算统计信息：
 
 CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name CFGNAME
 CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name pi0_fast_airbot_pick_place_low_mem_finetune
@@ -35,13 +55,13 @@ CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name pi0_fa
 
 微调：
 
-CUDA_VISIBLE_DEVICES=5 XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 uv run scripts/train.py pi0_fast_airbot_pick_place_low_mem_finetune --exp-name=pi0_fast_lora_absolute_airbot_pick_place --overwrite
+CUDA_VISIBLE_DEVICES=5 XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 uv run scripts/train.py pi0_fast_airbot_pick_place_low_mem_finetune --exp-name=pi0_fast_lora_absolute_airbot_pick_place --overwrite --no-wandb_enabled
 
 推理：
 
 uv run examples/simple_client/main.py --env ALOHA # test
 
 # in shell 1:
-openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_airbot_pick_place_low_mem_finetune --policy.dir=checkpoints/pi0_fast_airbot_pick_place_low_mem_finetune/pi0_fast_lora_airbot_pick_place
+openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_airbot_pick_place_low_mem_finetune --policy.dir=checkpoints/delta_13k/13000
 # in shell 2:
 Imitate-All$ python pi0_evaluate_client.py

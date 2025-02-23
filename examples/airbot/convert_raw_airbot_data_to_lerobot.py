@@ -1,11 +1,13 @@
 """
-Script to convert AIRBOT RDT hdf5 data (from convert_data_to_rdt_h5.py) to the LeRobot dataset v2.0 format.
-Should use convert_raw_airbot_data_to_lerobot.py instead.
+Script to convert AIRBOT raw data (from control_robot.py --record and the arm order is left,right, the cam order is front,left,right) to the LeRobot dataset v2.0 format.
+Will zero pad non-exist data, so can't directly used by pi0 model.
 
-Example usage: uv run examples/aloha_real/convert_aloha_data_to_lerobot.py --raw-dir /path/to/raw/data --repo-id <org>/<dataset-name>
+Example usage: uv run examples/aloha_real/convert_aloha_data_to_lerobot.py --raw-dir /path/to/raw/data --repo-id <org>/<dataset-name> [--no-push-to-hub]
 """
 
 import dataclasses
+import json
+import os
 from pathlib import Path
 import shutil
 from typing import Literal
@@ -32,13 +34,37 @@ class DatasetConfig:
 
 DEFAULT_DATASET_CONFIG = DatasetConfig()
 
+# TODO remove hardcoding
+# we set the task name and replace it in AirBotInput during training
+# task prompt will be its first match
+TASKS = {
+    "pick_place": "PICK_PLACE",
+    "stack_block": "STACK_BLOCK",
+    "transfer_block": "TRANSFER_BLOCK",
+    "stack_paper_cups": "STACK_PAPER_CUPS",
+    "flatten_and_fold_towel": "FLATTEN_AND_FOLD_TOWEL",
+    "orgnize_blocks_in_tray": "ORGANIZE_BLOCKS_IN_TRAY",
+}
+RIGHT_ONLY_KEYS = ["pick_place"]
+EXCLUDE_KEYS = []
+
+
+def find_ep_dirs(dir_path):
+    result = []
+
+    for root, dirs, files in os.walk(dir_path):
+        if "data_recording_info.json" in files:
+            for dir_name in dirs:
+                result.append(os.path.join(root, dir_name))
+
+    return result
+
 
 def create_empty_dataset(
     repo_id: str,
     robot_type: str,
     mode: Literal["video", "image"] = "video",
     *,
-    cameras: list[str],
     has_velocity: bool = False,
     has_effort: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
@@ -75,6 +101,7 @@ def create_empty_dataset(
                 motors,
             ],
         },
+        "right_only": {"dtype": "bool", "shape": (1,), "names": None},
     }
 
     if has_velocity:
@@ -95,7 +122,7 @@ def create_empty_dataset(
             ],
         }
 
-    for cam in cameras:
+    for cam in ["cam_high", "cam_left_wrist", "cam_right_wrist"]:
         features[f"observation.images.{cam}"] = {
             "dtype": mode,
             "shape": (3, 480, 640),
@@ -128,84 +155,111 @@ def get_cameras(hdf5_files: list[Path]) -> list[str]:
         return [key for key in ep["/observations/images"].keys() if "depth" not in key]  # noqa: SIM118
 
 
-def has_velocity(hdf5_files: list[Path]) -> bool:
-    with h5py.File(hdf5_files[0], "r") as ep:
-        return "/observations/qvel" in ep
+def has_velocity(ep_paths) -> bool:
+    with open(f"{ep_paths[0]}/low_dim.json") as f:
+        low_dim = json.load(f)
+    return "observation/arm/joint_velocity" in low_dim
 
 
-def has_effort(hdf5_files: list[Path]) -> bool:
-    with h5py.File(hdf5_files[0], "r") as ep:
-        return "/observations/effort" in ep
+def has_effort(ep_paths) -> bool:
+    with open(f"{ep_paths[0]}/low_dim.json") as f:
+        low_dim = json.load(f)
+    return "observation/arm/joint_effort" in low_dim
 
 
-def load_raw_images_per_camera(ep: h5py.File, cameras: list[str]) -> dict[str, np.ndarray]:
+def load_raw_episode_data(ep_path):
+    imgs_dirs = os.listdir(ep_path)
+    imgs_dirs = sorted([f"{ep_path}/{x}" for x in imgs_dirs if os.path.isdir(f"{ep_path}/{x}")])
+    with open(f"{ep_path}/low_dim.json") as f:
+        low_dim = json.load(f)
+    ep_len = len(low_dim["action/arm/joint_position"])
+    qpos = np.array(low_dim["observation/arm/joint_position"])
+    qaction = np.array(low_dim["action/arm/joint_position"])
+    gripper_pos = np.array(low_dim["observation/eef/joint_position"])
+    gripper_action = np.array(low_dim["action/eef/joint_position"])
+
+    if qpos.shape[-1] == 12:
+        # filp to right_arm, right_gripper, left_arm, left_gripper (6,1,6,1)
+        # so the right part is aligned with right arm only data
+        state = np.concatenate([qpos[:, 6:], gripper_pos[:, 1:2], qpos[:, :6], gripper_pos[:, 0:1]], axis=1)
+        action = np.concatenate(
+            [qaction[:, 6:], gripper_action[:, 1:2], qaction[:, :6], gripper_action[:, 0:1]], axis=1
+        )
+    elif qpos.shape[-1] == 6:
+        # NOTE here assert single arm airbot datasets are right arm
+        state = np.concatenate([qpos, gripper_pos, torch.zeros(ep_len, 7)], axis=1)
+        action = np.concatenate([qaction, gripper_action, torch.zeros(ep_len, 7)], axis=1)
+    else:
+        raise ValueError
+
+    velocity = None
+    effort = None
+
+    def find_path(img_paths, idx):
+        for p in img_paths:
+            if f"cam{idx}" in p:
+                return p
+        return None
+
     imgs_per_cam = {}
-    for camera in cameras:
-        if camera not in ep["/observations/images/"]:
-            imgs_per_cam[camera] = np.zeros_like(imgs_per_cam[cameras[0]])
+    for idx, camera in [(1, "cam_high"), (2, "cam_left_wrist"), (3, "cam_right_wrist")]:
+        img_path = find_path(imgs_dirs, idx)
+        if not img_path:
+            imgs_per_cam[camera] = np.zeros_like(imgs_per_cam["cam_high"])
             continue
         imgs_array = []
-        for data in ep[f"/observations/images/{camera}"]:
-            img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), 1)
+        for i in range(ep_len):
+            img = cv2.imread(f"{img_path}/frame_{i:06}.jpg", cv2.IMREAD_COLOR)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             imgs_array.append(img)
 
         imgs_per_cam[camera] = np.array(imgs_array)
-    return imgs_per_cam
-
-
-def load_raw_episode_data(
-    ep_path: Path,
-    cameras: list[str],
-) -> tuple[dict[str, np.ndarray], torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    with h5py.File(ep_path, "r") as ep:
-        state = torch.from_numpy(ep["/observations/qpos"][:])
-        action = torch.from_numpy(ep["/action"][:])
-        if state.shape[-1] == 14:
-            # filp to right_arm, right_gripper, left_arm, left_gripper (6,1,6,1)
-            # so the right part is aligned with right arm only data
-            state = torch.cat([state[:, 7:], state[:, :7]], dim=1)
-            action = torch.cat([action[:, 7:], action[:, :7]], dim=1)
-        elif state.shape[-1] == 7:
-            # NOTE here assert single arm airbot datasets are right arm
-            state = torch.cat([state, torch.zeros_like(state)], dim=1)
-            action = torch.cat([action, torch.zeros_like(action)], dim=1)
-        else:
-            raise ValueError
-
-        velocity = None
-        # if "/observations/qvel" in ep:
-        #     velocity = torch.from_numpy(ep["/observations/qvel"][:])
-
-        effort = None
-        # if "/observations/effort" in ep:
-        #     effort = torch.from_numpy(ep["/observations/effort"][:])
-
-        imgs_per_cam = load_raw_images_per_camera(ep, cameras)
 
     return imgs_per_cam, state, action, velocity, effort
 
 
 def populate_dataset(
     dataset: LeRobotDataset,
-    hdf5_files: list[Path],
-    task: str,
-    cameras: list[str],
+    ep_dirs,
+    task_prompts_dict,
+    right_only_keys,
+    exclude_keys,
     episodes: list[int] | None = None,
 ) -> LeRobotDataset:
     if episodes is None:
-        episodes = range(len(hdf5_files))
+        episodes = range(len(ep_dirs))
 
     for ep_idx in tqdm.tqdm(episodes):
-        ep_path = hdf5_files[ep_idx]
+        ep_path = ep_dirs[ep_idx]
 
-        imgs_per_cam, state, action, velocity, effort = load_raw_episode_data(ep_path, cameras)
+        skip = False
+        for key in exclude_keys:
+            if key in ep_path:
+                print(f"skipped {ep_path}")
+                skip = True
+        if skip:
+            continue
+
+        right_only = False
+        for key in right_only_keys:
+            if key in ep_path:
+                right_only = True
+
+        task_prompt = None
+        for task in task_prompts_dict:
+            if task in ep_path:
+                task_prompt = task_prompts_dict[task]
+                break
+        assert task_prompt
+
+        imgs_per_cam, state, action, velocity, effort = load_raw_episode_data(ep_path)
         num_frames = state.shape[0]
 
         for i in range(num_frames):
             frame = {
                 "observation.state": state[i],
                 "action": action[i],
+                "right_only": right_only,
             }
 
             for camera, img_array in imgs_per_cam.items():
@@ -218,7 +272,7 @@ def populate_dataset(
 
             dataset.add_frame(frame)
 
-        dataset.save_episode(task=task)
+        dataset.save_episode(task=task_prompt)
 
     return dataset
 
@@ -227,14 +281,12 @@ def port_aloha(
     raw_dir: Path,
     repo_id: str,
     raw_repo_id: str | None = None,
-    task: str = "DEBUG",
     *,
     episodes: list[int] | None = None,
     push_to_hub: bool = True,
     is_mobile: bool = False,
-    mode: Literal["video", "image"] = "image",
+    mode: Literal["video", "image"] = "video",
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
-    right: bool = False,
 ):
     if (LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(LEROBOT_HOME / repo_id)
@@ -244,27 +296,23 @@ def port_aloha(
             raise ValueError("raw_repo_id must be provided if raw_dir does not exist")
         download_raw(raw_dir, repo_id=raw_repo_id)
 
-    hdf5_files = sorted(raw_dir.glob("*.hdf5"))
-
-    cameras = get_cameras(hdf5_files)
-    assert set(cameras).issubset({"cam_high", "cam_left_wrist", "cam_right_wrist"})
-    # cameras取决于原始h5文件中的key,可能没有cam_left_wrist
-    # 但state和action总是14维,因为这样方便点(部署时就发现不方便了)
+    ep_dirs = find_ep_dirs(raw_dir)
+    print(f"found {len(ep_dirs)} episodes.")
 
     dataset = create_empty_dataset(
         repo_id,
         robot_type="mobile_aloha" if is_mobile else "aloha",
         mode=mode,
-        cameras=cameras,
-        has_effort=has_effort(hdf5_files),
-        has_velocity=has_velocity(hdf5_files),
+        has_effort=has_effort(ep_dirs),
+        has_velocity=has_velocity(ep_dirs),
         dataset_config=dataset_config,
     )
     dataset = populate_dataset(
         dataset,
-        hdf5_files,
-        task=task,
-        cameras=cameras,
+        ep_dirs,
+        task_prompts_dict=TASKS,
+        right_only_keys=RIGHT_ONLY_KEYS,
+        exclude_keys=EXCLUDE_KEYS,
         episodes=episodes,
     )
     dataset.consolidate(run_compute_stats=False)

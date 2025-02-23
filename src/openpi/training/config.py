@@ -297,7 +297,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 class LeRobotAirbotDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
     # Gripper dimensions will remain in absolute values.
-    use_delta_joint_actions: bool = True
+    use_delta_joint_actions: bool = False
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
     # If true, assume the dataset don't contains left arm cam images
@@ -305,23 +305,6 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=_transforms.Group())
-    # repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
-    #     default=_transforms.Group(
-    #         inputs=[
-    #             _transforms.RepackTransform(
-    #                 {
-    #                     "images": {
-    #                         "cam_high": "observation.images.cam_high",
-    #                         # "cam_left_wrist": "observation.images.cam_left_wrist", #因为lerobot dataset中可能没有observation.images.cam_left_wrist
-    #                         "cam_right_wrist": "observation.images.cam_right_wrist",
-    #                     },
-    #                     "state": "observation.state",
-    #                     "actions": "action",
-    #                 }
-    #             )
-    #         ]
-    #     ),
-    # )
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
 
@@ -337,7 +320,7 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
             "repack_transforms",
             _transforms.Group(
                 inputs=[
-                    # 将convert_airbot_data_to_lerobot.py中保存的key(这个dict的value)变换为AirbotInputs(data)使用的key(这个dict的key)
+                    # 将convert_airbot_data_to_lerobot.py中保存的key(这个dict的value)变换为AirbotInputs.__call__使用的key(这个dict的key)
                     _transforms.RepackTransform(
                         {
                             "images": images,
@@ -638,27 +621,11 @@ _CONFIGS = [
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
     # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
     TrainConfig(
-        name="pi0_airbot_pick_place",
-        model=pi0.Pi0Config(),
+        name="pi0_fast_airbot_all",
+        model=pi0_fast.Pi0FASTConfig(action_dim=14),
         data=LeRobotAirbotDataConfig(
-            repo_id="destroy314/pick_place",
+            repo_id="destroy314/all",
             assets=AssetsConfig(assets_dir="assets"),
-            default_prompt="Pick up the block on the table and place it in the red square area.",
-            base_config=DataConfig(
-                local_files_only=True,  # Set to True for local-only datasets.
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
-    ),
-    TrainConfig(
-        name="pi0_fast_airbot_pick_place",
-        # 不知道为什么会有，只出现在fast时(pi0_fast_droid pi0_fast_libero)
-        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
-        data=LeRobotAirbotDataConfig(
-            repo_id="destroy314/pick_place",
-            assets=AssetsConfig(assets_dir="assets"),
-            default_prompt="Pick up the block on the table and place it in the red square area.",
             base_config=DataConfig(
                 local_files_only=True,  # Set to True for local-only datasets.
             ),
@@ -666,30 +633,10 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=20_000,
     ),
-    # 3090: 41h for 20k steps
-    TrainConfig(
-        name="pi0_airbot_pick_place_low_mem_finetune",
-        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotAirbotDataConfig(
-            repo_id="destroy314/pick_place",
-            right_only=True,
-            assets=AssetsConfig(assets_dir="assets"),
-            default_prompt="Pick up the block on the table and place it in the red square area.",
-            base_config=DataConfig(
-                local_files_only=True,  # Set to True for local-only datasets.
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
-        freeze_filter=pi0.Pi0Config(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
     # 3090: 26h for 20k steps (bs=16)
     TrainConfig(
         name="pi0_fast_airbot_pick_place_low_mem_finetune",
-        model=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora"),
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, paligemma_variant="gemma_2b_lora"),
         data=LeRobotAirbotDataConfig(
             repo_id="destroy314/pick_place",
             right_only=True,
@@ -704,10 +651,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=20_000,
         freeze_filter=pi0_fast.Pi0FASTConfig(
-            action_dim=7,
-            action_horizon=10,
-            max_token_len=180,
-            paligemma_variant="gemma_2b_lora",  # 不知道为什么会有，只出现在fast+lora时(pi0_fast_libero_low_mem_finetune)
+            paligemma_variant="gemma_2b_lora",
         ).get_freeze_filter(),
         ema_decay=None,
     ),

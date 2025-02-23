@@ -6,6 +6,36 @@ import numpy as np
 from openpi import transforms
 from openpi.models import model as _model
 
+# TODO remove hardcoding
+TASK_AUGMENTATION = {
+    "PICK_PLACE": [
+        "Pick up the block on the table and place it in the red square area.",
+        "Place the block in the red square.",
+    ],
+    "TRANSFER_BLOCK": [
+        "Pick up the block with the closest hand, give it to the other hand and place it.",
+    ],
+    "STACK_BLOCK": [
+        "Stack the three blocks in the red rectangle.",
+        "Stack the three blocks on top of each other in the red square.",
+    ],
+    "STACK_PAPER_CUPS": [
+        "Nest all paper cups together.",
+    ],
+    "FLATTEN_AND_FOLD_TOWEL": [
+        "Flatten the towel and fold it along the long side.",
+    ],
+    "ORGANIZE_BLOCKS_IN_TRAY": [
+        "Use right arm to pick up the blocks, handed to left arm, and place them in the tray by color.",
+    ],
+}
+
+HALT_COMMANDS = [
+    "halt",
+    "stop moving",
+    "hold still",
+]
+
 
 def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
@@ -18,7 +48,7 @@ def _parse_image(image) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class AirbotInputs(transforms.DataTransformFn):
-    """Inputs for the Aloha policy.
+    """Inputs for the Airbot policy.
 
     Expected inputs:
     - images: dict[name, img] where img is [channel, height, width].
@@ -30,6 +60,12 @@ class AirbotInputs(transforms.DataTransformFn):
     action_dim: int
 
     model_type: _model.ModelType = _model.ModelType.PI0
+
+    # Whether to randomly choose prompt in TASK_AUGMENTATION, otherwise use the first one.
+    prompt_augmentation: bool = False
+
+    # Probability replace the action with state, and replace the prompt with HALT_COMMANDS.
+    halt_injection_prob: float = 0.02
 
     def __call__(self, data: dict) -> dict:
         mask_padding = self.model_type == _model.ModelType.PI0
@@ -74,18 +110,26 @@ class AirbotInputs(transforms.DataTransformFn):
             inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
 
         if "prompt" in data:
-            inputs["prompt"] = data["prompt"]
+            if data["prompt"].isupper():
+                if self.prompt_augmentation:
+                    inputs["prompt"] = np.random.choice(TASK_AUGMENTATION[data["prompt"]])
+                else:
+                    inputs["prompt"] = TASK_AUGMENTATION[data["prompt"]][0]
+            else:
+                inputs["prompt"] = data["prompt"]
+
+        if np.random.uniform() < self.halt_injection_prob:
+            inputs["prompt"] = np.random.choice(HALT_COMMANDS)
+            actions = np.repeat(inputs["state"], self.action_dim, axis=0)
+            # actions += np.random.uniform(-0.1, 0.1, size=actions.shape)
+            inputs["actions"] = actions
 
         return inputs
 
 
 @dataclasses.dataclass(frozen=True)
 class AirbotOutputs(transforms.DataTransformFn):
-    """Outputs for the Aloha policy."""
-
-    # If true, this will convert the joint and gripper values from the standard Aloha space to
-    # the space used by the pi internal runtime which was used to train the base model.
-    adapt_to_pi: bool = True
+    """Outputs for the Airbot policy."""
 
     def __call__(self, data: dict) -> dict:
         # Only return the first 14 dims.
