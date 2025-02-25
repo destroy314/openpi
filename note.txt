@@ -1,11 +1,18 @@
 这一脚本应该可以将RDT的airbot h5数据集（由convert_data_to_rdt_h5.py创建）转为lerobot格式。HFID应为你的huggingface id，不过不上传的话无关紧要；DATASET为数据集名称。447条✕250帧✕2相机≈30min
 
+export PATH=~/yangzhuo/ffmpeg-7.0.2-amd64-static:${PATH}
+export LEROBOT_HOME=/baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot
+
 uv run examples/airbot/convert_airbot_data_to_lerobot.py --raw_dir datasets/pick_place --repo_id HFID/DATASET --no-push-to-hub
-uv run examples/airbot/convert_raw_airbot_data_to_lerobot.py --raw_dir datasets/raw --repo_id destroy314/airbot --no-push-to-hub
+uv run examples/airbot/convert_raw_airbot_data_to_lerobot.py --raw_dir data/airbot_data_raw --repo_id destroy314/airbot_all --no-push-to-hub
+uv run examples/airbot/remove_cache_images.py --root_folder data/lerobot/destroy314/airbot_all/images #因为lerobot在转换完后才会删除图片😅
+注意当前的airbot_all数据集的fps设错了（应为25，实为50），但除了导致视频播放的更快外好像没有不利影响，先不管了
+这直接导致了下面的超出tolerance错误。暂且改了video_utils.py decode_video_frames_torchvision把timestamps中的值除2
 
 > TODO
-> raw->lerobot的转换脚本
->
+> raw->lerobot的转换脚本（convert_airbot_data_to_lerobot.py）已经写好了
+> 视频看起来有点闪，帧内压缩的原因？
+> 
 > 接下来会涉及单/双臂数据混合训练
 > a. 正常保存并修改create_dataset使用MultiLeRobotDataset以混合不同数据集（以后还是用这个方案吧）
 > 或
@@ -43,6 +50,18 @@ uv run examples/airbot/convert_raw_airbot_data_to_lerobot.py --raw_dir datasets/
 
 CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name CFGNAME
 CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name pi0_fast_airbot_pick_place_low_mem_finetune
+CUDA_VISIBLE_DEVICES=1 HF_ENDPOINT=https://hf-mirror.com LEROBOT_HOME=/baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot uv run scripts/compute_norm_stats.py --config-name pi0_fast_airbot_all
+
+TODO
+解决超出tolerance的问题
+AssertionError: One or several query timestamps unexpectedly violate the tolerance (tensor([0.1000]) > tolerance_s=0.1).It means that the closest frame that can be loaded from the video is too far away in time.This might be due to synchronization issues with timestamps during data collection.To be safe, we advise to ignore this item during training.
+queried timestamps: tensor([16.])
+loaded timestamps: tensor([15.8800, 15.9000])
+video: /baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot/destroy314/airbot_all/videos/chunk-000/observation.images.cam_high/episode_000020.mp4
+.../episode_000031.mp4
+backend: pyav
+TODO
+修复当前数据集视频的fps
 
 这会产生.assets/CFGNAME/HFID/DATASET/norm_stats.json，并在微调时使用。对于共享数据集的多个config，可以手动复制对应的统计信息。
 
@@ -56,6 +75,28 @@ CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name pi0_fa
 微调：
 
 CUDA_VISIBLE_DEVICES=5 XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 uv run scripts/train.py pi0_fast_airbot_pick_place_low_mem_finetune --exp-name=pi0_fast_lora_absolute_airbot_pick_place --overwrite --no-wandb_enabled
+
+export HF_ENDPOINT=https://hf-mirror.com
+export LEROBOT_HOME=/baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot
+export CUDA_VISIBLE_DEVICES=7
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.99
+
+CUDA_VISIBLE_DEVICES=4 HF_ENDPOINT=https://hf-mirror.com LEROBOT_HOME=/baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 uv run scripts/train.py pi0_fast_airbot_all --exp-name=debug --overwrite --no-wandb_enabled
+CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com LEROBOT_HOME=/baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 uv run scripts/train.py pi0_fast_lora_airbot_all --exp-name=debug --overwrite --no-wandb_enabled
+
+Volcengine:挂载vePFS和Nas
+
+WANDB_MODE offline
+LEROBOT_HOME /baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot
+XLA_PYTHON_CLIENT_MEM_FRACTION 0.99
+HF_ENDPOINT https://hf-mirror.com
+
+cd /baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/yangzhuo/openpi
+/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/miniconda3/bin/uv run scripts/train.py pi0_fast_lora_airbot_all --exp-name=pi0_fast_lora_airbot --overwrite
+
+cd /baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/yangzhuo/openpi
+/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/miniconda3/bin/uv run scripts/train.py pi0_fast_airbot_all --exp-name=pi0_fast_airbot --overwrite
+
 
 推理：
 

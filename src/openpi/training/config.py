@@ -122,12 +122,21 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizeFASTInputs(
-                            _tokenizer.FASTTokenizer(model_config.max_token_len),
+                            _tokenizer.FASTTokenizer(
+                                model_config.max_token_len,
+                                # 直接设hf mirror让算力机自己下还简单点
+                                fast_tokenizer_path="/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/huggingface/hub/models--physical-intelligence--fast/snapshots/ec4d7aa71691cac0b8bed6942be45684db2110f4",
+                                paligemma_tokenizer_path="/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/big_vision/paligemma_tokenizer.model",
+                            ),
                         ),
                     ],
                     outputs=[
                         _transforms.ExtractFASTActions(
-                            _tokenizer.FASTTokenizer(model_config.max_token_len),
+                            _tokenizer.FASTTokenizer(
+                                model_config.max_token_len,
+                                fast_tokenizer_path="/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/huggingface/hub/models--physical-intelligence--fast/snapshots/ec4d7aa71691cac0b8bed6942be45684db2110f4",
+                                paligemma_tokenizer_path="/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/big_vision/paligemma_tokenizer.model",
+                            ),
                             action_horizon=model_config.action_horizon,
                             action_dim=model_config.action_dim,
                         )
@@ -326,6 +335,8 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
                             "images": images,
                             "state": "observation.state",
                             "actions": "action",
+                            "prompt": "prompt",
+                            # "right_only": "right_only",
                         }
                     )
                 ]
@@ -353,6 +364,7 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+            prompt_from_task=True,
         )
 
 
@@ -620,18 +632,47 @@ _CONFIGS = [
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
     # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
+    # ~22h on single A800, ~12h on two
     TrainConfig(
         name="pi0_fast_airbot_all",
         model=pi0_fast.Pi0FASTConfig(action_dim=14),
         data=LeRobotAirbotDataConfig(
-            repo_id="destroy314/all",
+            repo_id="destroy314/airbot_all",
             assets=AssetsConfig(assets_dir="assets"),
             base_config=DataConfig(
-                local_files_only=True,  # Set to True for local-only datasets.
+                local_files_only=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
         num_train_steps=20_000,
+        save_interval=2500,
+        checkpoint_base_dir="/baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints",
+    ),
+    # ~18h on single A800, ~10h on two
+    TrainConfig(
+        name="pi0_fast_lora_airbot_all",
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, paligemma_variant="gemma_2b_lora"),
+        data=LeRobotAirbotDataConfig(
+            repo_id="destroy314/airbot_all",
+            assets=AssetsConfig(assets_dir="assets"),
+            base_config=DataConfig(
+                local_files_only=True,
+            ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        num_train_steps=20_000,
+        save_interval=2500,
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="/baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints",
     ),
     # 3090: 26h for 20k steps (bs=16)
     TrainConfig(

@@ -44,9 +44,10 @@ TASKS = {
     "stack_paper_cups": "STACK_PAPER_CUPS",
     "flatten_and_fold_towel": "FLATTEN_AND_FOLD_TOWEL",
     "orgnize_blocks_in_tray": "ORGANIZE_BLOCKS_IN_TRAY",
+    "wipe_whiteboard": "WIPE_WHITEBOARD",
 }
 RIGHT_ONLY_KEYS = ["pick_place"]
-EXCLUDE_KEYS = []
+EXCLUDE_KEYS = ["stack_block_0106_xuwang/7"]
 
 
 def find_ep_dirs(dir_path):
@@ -57,7 +58,7 @@ def find_ep_dirs(dir_path):
             for dir_name in dirs:
                 result.append(os.path.join(root, dir_name))
 
-    return result
+    return sorted(result)
 
 
 def create_empty_dataset(
@@ -138,7 +139,7 @@ def create_empty_dataset(
 
     return LeRobotDataset.create(
         repo_id=repo_id,
-        fps=50,
+        fps=25,
         robot_type=robot_type,
         features=features,
         use_videos=dataset_config.use_videos,
@@ -191,6 +192,8 @@ def load_raw_episode_data(ep_path):
         action = np.concatenate([qaction, gripper_action, torch.zeros(ep_len, 7)], axis=1)
     else:
         raise ValueError
+
+    assert state.shape[-1] == action.shape[-1] == 14
 
     velocity = None
     effort = None
@@ -250,29 +253,35 @@ def populate_dataset(
             if task in ep_path:
                 task_prompt = task_prompts_dict[task]
                 break
-        assert task_prompt
 
-        imgs_per_cam, state, action, velocity, effort = load_raw_episode_data(ep_path)
-        num_frames = state.shape[0]
+        try:
+            assert task_prompt
 
-        for i in range(num_frames):
-            frame = {
-                "observation.state": state[i],
-                "action": action[i],
-                "right_only": right_only,
-            }
+            imgs_per_cam, state, action, velocity, effort = load_raw_episode_data(ep_path)
+            num_frames = state.shape[0]
 
-            for camera, img_array in imgs_per_cam.items():
-                frame[f"observation.images.{camera}"] = img_array[i]
+            for i in range(num_frames):
+                frame = {
+                    "observation.state": state[i],
+                    "action": action[i],
+                    "right_only": right_only,
+                }
 
-            if velocity is not None:
-                frame["observation.velocity"] = velocity[i]
-            if effort is not None:
-                frame["observation.effort"] = effort[i]
+                for camera, img_array in imgs_per_cam.items():
+                    frame[f"observation.images.{camera}"] = img_array[i]
 
-            dataset.add_frame(frame)
+                if velocity is not None:
+                    frame["observation.velocity"] = velocity[i]
+                if effort is not None:
+                    frame["observation.effort"] = effort[i]
 
-        dataset.save_episode(task=task_prompt)
+                dataset.add_frame(frame)
+
+            dataset.save_episode(task=task_prompt)
+
+        except Exception as e:
+            print(f"Error processing episode {ep_path}: {e}")
+            dataset.clear_episode_buffer()
 
     return dataset
 

@@ -28,6 +28,9 @@ TASK_AUGMENTATION = {
     "ORGANIZE_BLOCKS_IN_TRAY": [
         "Use right arm to pick up the blocks, handed to left arm, and place them in the tray by color.",
     ],
+    "WIPE_WHITEBOARD": [
+        "Wipe the whiteboard clean with right arm.",
+    ],
 }
 
 HALT_COMMANDS = [
@@ -120,9 +123,9 @@ class AirbotInputs(transforms.DataTransformFn):
 
         if np.random.uniform() < self.halt_injection_prob:
             inputs["prompt"] = np.random.choice(HALT_COMMANDS)
-            actions = np.repeat(inputs["state"], self.action_dim, axis=0)
-            # actions += np.random.uniform(-0.1, 0.1, size=actions.shape)
-            inputs["actions"] = actions
+            inputs["actions"][:] = state
+
+        assert "prompt" in inputs
 
         return inputs
 

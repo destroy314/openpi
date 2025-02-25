@@ -37,11 +37,18 @@ class PaligemmaTokenizer:
 
 
 class FASTTokenizer:
-    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+    def __init__(
+        self,
+        max_len: int = 256,
+        fast_tokenizer_path: str = "physical-intelligence/fast",
+        paligemma_tokenizer_path: str | None = None,
+    ):
         self._max_len = max_len
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        if paligemma_tokenizer_path is None:
+            paligemma_tokenizer_path = "gs://big_vision/paligemma_tokenizer.model"
+        path = download.maybe_download(paligemma_tokenizer_path, gs={"token": "anon"})
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
