@@ -68,7 +68,7 @@ class AirbotInputs(transforms.DataTransformFn):
     prompt_augmentation: bool = False
 
     # Probability replace the action with state, and replace the prompt with HALT_COMMANDS.
-    halt_injection_prob: float = 0.02
+    halt_injection_prob: float = 0.0
 
     def __call__(self, data: dict) -> dict:
         mask_padding = self.model_type == _model.ModelType.PI0
@@ -121,7 +121,7 @@ class AirbotInputs(transforms.DataTransformFn):
             else:
                 inputs["prompt"] = data["prompt"]
 
-        if np.random.uniform() < self.halt_injection_prob:
+        if "actions" in data and np.random.uniform() < self.halt_injection_prob:
             inputs["prompt"] = np.random.choice(HALT_COMMANDS)
             inputs["actions"][:] = state
 

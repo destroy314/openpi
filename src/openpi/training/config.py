@@ -124,9 +124,6 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizeFASTInputs(
                             _tokenizer.FASTTokenizer(
                                 model_config.max_token_len,
-                                # 直接设hf mirror让算力机自己下还简单点
-                                fast_tokenizer_path="/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/huggingface/hub/models--physical-intelligence--fast/snapshots/ec4d7aa71691cac0b8bed6942be45684db2110f4",
-                                paligemma_tokenizer_path="/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/big_vision/paligemma_tokenizer.model",
                             ),
                         ),
                     ],
@@ -134,8 +131,6 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.ExtractFASTActions(
                             _tokenizer.FASTTokenizer(
                                 model_config.max_token_len,
-                                fast_tokenizer_path="/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/huggingface/hub/models--physical-intelligence--fast/snapshots/ec4d7aa71691cac0b8bed6942be45684db2110f4",
-                                paligemma_tokenizer_path="/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/big_vision/paligemma_tokenizer.model",
                             ),
                             action_horizon=model_config.action_horizon,
                             action_dim=model_config.action_dim,
@@ -306,7 +301,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 class LeRobotAirbotDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
     # Gripper dimensions will remain in absolute values.
-    use_delta_joint_actions: bool = False
+    use_delta_joint_actions: bool = True
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
     # If true, assume the dataset don't contains left arm cam images
@@ -643,13 +638,8 @@ _CONFIGS = [
                 local_files_only=True,
             ),
         ),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/openpi-assets/checkpoints/pi0_fast_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=20_000,
-        save_interval=2500,
-        checkpoint_base_dir="/baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints",
     ),
     # ~18h on single A800, ~10h on two
     TrainConfig(
@@ -662,17 +652,12 @@ _CONFIGS = [
                 local_files_only=True,
             ),
         ),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/openpi-assets/checkpoints/pi0_fast_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=20_000,
-        save_interval=2500,
         freeze_filter=pi0_fast.Pi0FASTConfig(
             paligemma_variant="gemma_2b_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        checkpoint_base_dir="/baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints",
     ),
     # 3090: 26h for 20k steps (bs=16)
     TrainConfig(

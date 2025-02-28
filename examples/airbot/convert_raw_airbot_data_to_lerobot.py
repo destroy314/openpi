@@ -34,6 +34,15 @@ class DatasetConfig:
 
 DEFAULT_DATASET_CONFIG = DatasetConfig()
 
+LEFT_INIT_POS = [
+    -0.05664911866188049,
+    -0.26874953508377075,
+    0.5613412857055664,
+    1.483367681503296,
+    -1.1999313831329346,
+    -1.3498512506484985,
+    0,
+]
 # TODO remove hardcoding
 # we set the task name and replace it in AirBotInput during training
 # task prompt will be its first match
@@ -47,8 +56,27 @@ TASKS = {
     "wipe_whiteboard": "WIPE_WHITEBOARD",
 }
 RIGHT_ONLY_KEYS = ["pick_place"]
+INCLUDE_KEYS = ["stack_block"]
 EXCLUDE_KEYS = ["stack_block_0106_xuwang/7"]
 
+
+def find_match(list, key):
+    for item in list:
+        if key in item:
+            return item
+    return None
+
+def find_key(key_list, s):
+    for key in key_list:
+        if key in s:
+            return key
+    return None
+
+def get_task_prompt(name):
+    for task in TASKS:
+        if task in name:
+            return TASKS[task]
+    return None
 
 def find_ep_dirs(dir_path):
     result = []
@@ -56,7 +84,20 @@ def find_ep_dirs(dir_path):
     for root, dirs, files in os.walk(dir_path):
         if "data_recording_info.json" in files:
             for dir_name in dirs:
-                result.append(os.path.join(root, dir_name))
+                full_dir = str(os.path.join(root, dir_name))
+
+                if INCLUDE_KEYS and not find_key(INCLUDE_KEYS, full_dir):
+                    continue
+
+                if EXCLUDE_KEYS and find_key(EXCLUDE_KEYS, full_dir):
+                    print(f"skipped {full_dir} by EXCLUDE_KEYS")
+                    continue
+
+                if not get_task_prompt(full_dir):
+                    print(f"skipped {full_dir} not in TASKS")
+                    continue
+
+                result.append(full_dir)
 
     return sorted(result)
 
@@ -188,8 +229,8 @@ def load_raw_episode_data(ep_path):
         )
     elif qpos.shape[-1] == 6:
         # NOTE here assert single arm airbot datasets are right arm
-        state = np.concatenate([qpos, gripper_pos, torch.zeros(ep_len, 7)], axis=1)
-        action = np.concatenate([qaction, gripper_action, torch.zeros(ep_len, 7)], axis=1)
+        state = np.concatenate([qpos, gripper_pos, np.tile(LEFT_INIT_POS, (ep_len, 1))], axis=1)
+        action = np.concatenate([qaction, gripper_action, np.tile(LEFT_INIT_POS, (ep_len, 1))], axis=1)
     else:
         raise ValueError
 
@@ -198,15 +239,9 @@ def load_raw_episode_data(ep_path):
     velocity = None
     effort = None
 
-    def find_path(img_paths, idx):
-        for p in img_paths:
-            if f"cam{idx}" in p:
-                return p
-        return None
-
     imgs_per_cam = {}
     for idx, camera in [(1, "cam_high"), (2, "cam_left_wrist"), (3, "cam_right_wrist")]:
-        img_path = find_path(imgs_dirs, idx)
+        img_path = find_match(imgs_dirs, f"cam{idx}")
         if not img_path:
             imgs_per_cam[camera] = np.zeros_like(imgs_per_cam["cam_high"])
             continue
@@ -224,9 +259,6 @@ def load_raw_episode_data(ep_path):
 def populate_dataset(
     dataset: LeRobotDataset,
     ep_dirs,
-    task_prompts_dict,
-    right_only_keys,
-    exclude_keys,
     episodes: list[int] | None = None,
 ) -> LeRobotDataset:
     if episodes is None:
@@ -235,28 +267,10 @@ def populate_dataset(
     for ep_idx in tqdm.tqdm(episodes):
         ep_path = ep_dirs[ep_idx]
 
-        skip = False
-        for key in exclude_keys:
-            if key in ep_path:
-                print(f"skipped {ep_path}")
-                skip = True
-        if skip:
-            continue
-
-        right_only = False
-        for key in right_only_keys:
-            if key in ep_path:
-                right_only = True
-
-        task_prompt = None
-        for task in task_prompts_dict:
-            if task in ep_path:
-                task_prompt = task_prompts_dict[task]
-                break
+        right_only = bool(find_key(RIGHT_ONLY_KEYS, ep_path))
+        task_prompt = get_task_prompt(ep_path)
 
         try:
-            assert task_prompt
-
             imgs_per_cam, state, action, velocity, effort = load_raw_episode_data(ep_path)
             num_frames = state.shape[0]
 
@@ -319,9 +333,6 @@ def port_aloha(
     dataset = populate_dataset(
         dataset,
         ep_dirs,
-        task_prompts_dict=TASKS,
-        right_only_keys=RIGHT_ONLY_KEYS,
-        exclude_keys=EXCLUDE_KEYS,
         episodes=episodes,
     )
     dataset.consolidate(run_compute_stats=False)
