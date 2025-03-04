@@ -9,24 +9,25 @@ from openpi.models import model as _model
 # TODO remove hardcoding
 TASK_AUGMENTATION = {
     "PICK_PLACE": [
-        "Pick up the block on the table and place it in the red square area.",
-        "Place the block in the red square.",
+        "Use right arm to pick up the block on the table and place it in the red square area.",
+        "Place the block in the red square with right arm, keep left arm still.",
     ],
     "TRANSFER_BLOCK": [
         "Pick up the block with the closest hand, give it to the other hand and place it.",
     ],
     "STACK_BLOCK": [
-        "Stack the three blocks in the red rectangle.",
-        "Stack the three blocks on top of each other in the red square.",
+        "Use left and right arm to stack the three blocks in the red rectangle.",
+        "Stack the three blocks on top of each other in the red square with dual arms.",
     ],
     "STACK_PAPER_CUPS": [
         "Nest all paper cups together.",
     ],
-    "FLATTEN_AND_FOLD_TOWEL": [
+    "FOLD_TOWEL": [
         "Flatten the towel and fold it along the long side.",
     ],
-    "ORGANIZE_BLOCKS_IN_TRAY": [
+    "ORGANIZE_BLOCK": [
         "Use right arm to pick up the blocks, handed to left arm, and place them in the tray by color.",
+        "Pick up the blocks with right arm, and place them in the tray with left arm.",
     ],
     "WIPE_WHITEBOARD": [
         "Wipe the whiteboard clean with right arm.",
@@ -70,6 +71,9 @@ class AirbotInputs(transforms.DataTransformFn):
     # Probability replace the action with state, and replace the prompt with HALT_COMMANDS.
     halt_injection_prob: float = 0.0
 
+    # If true, the left and right wrist images are swapped, to align with single arm pretraining data like libero.
+    inverse_wrist: bool = False
+
     def __call__(self, data: dict) -> dict:
         mask_padding = self.model_type == _model.ModelType.PI0
 
@@ -93,6 +97,11 @@ class AirbotInputs(transforms.DataTransformFn):
             "left_wrist_0_rgb": "cam_left_wrist",
             "right_wrist_0_rgb": "cam_right_wrist",
         }
+        if self.inverse_wrist:
+            extra_image_names = {
+                "left_wrist_0_rgb": "cam_right_wrist",
+                "right_wrist_0_rgb": "cam_left_wrist",
+            }
         for dest, source in extra_image_names.items():
             if source in in_images:
                 images[dest] = _parse_image(in_images[source])
@@ -113,19 +122,19 @@ class AirbotInputs(transforms.DataTransformFn):
             inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
 
         if "prompt" in data:
-            if data["prompt"].isupper():
-                if self.prompt_augmentation:
-                    inputs["prompt"] = np.random.choice(TASK_AUGMENTATION[data["prompt"]])
-                else:
-                    inputs["prompt"] = TASK_AUGMENTATION[data["prompt"]][0]
+            if data["prompt"] not in TASK_AUGMENTATION:
+                raise ValueError(f"prompt should be keys of TASK_AUGMENTATION, got: {data['prompt']}")
+            if self.prompt_augmentation:
+                inputs["prompt"] = np.random.choice(TASK_AUGMENTATION[data["prompt"]])
             else:
-                inputs["prompt"] = data["prompt"]
+                inputs["prompt"] = TASK_AUGMENTATION[data["prompt"]][0]
+        else:
+            # will get prompt from InjectDefaultPrompt
+            pass
 
         if "actions" in data and np.random.uniform() < self.halt_injection_prob:
             inputs["prompt"] = np.random.choice(HALT_COMMANDS)
             inputs["actions"][:] = state
-
-        assert "prompt" in inputs
 
         return inputs
 

@@ -46,18 +46,27 @@ LEFT_INIT_POS = [
 # TODO remove hardcoding
 # we set the task name and replace it in AirBotInput during training
 # task prompt will be its first match
-TASKS = {
-    "pick_place": "PICK_PLACE",
-    "stack_block": "STACK_BLOCK",
-    "transfer_block": "TRANSFER_BLOCK",
-    "stack_paper_cups": "STACK_PAPER_CUPS",
-    "flatten_and_fold_towel": "FLATTEN_AND_FOLD_TOWEL",
-    "orgnize_blocks_in_tray": "ORGANIZE_BLOCKS_IN_TRAY",
-    "wipe_whiteboard": "WIPE_WHITEBOARD",
-}
+TASKS = [
+    "pick_place",
+    "stack_block",
+    "transfer_block",
+    "stack_paper_cups",
+    "fold_towel",
+    "orgnize_block",
+    "wipe_whiteboard",
+]
+TASKS = {name: name.upper() for name in TASKS}
 RIGHT_ONLY_KEYS = ["pick_place"]
-INCLUDE_KEYS = ["stack_block"]
-EXCLUDE_KEYS = ["stack_block_0106_xuwang/7"]
+# INCLUDE_KEYS = ["pick_place"]
+# INCLUDE_KEYS = ["stack_block"]
+INCLUDE_KEYS = ["orgnize_block"]
+EXCLUDE_KEYS = [
+    "pick_place_0116_yangz/47",
+    "stack_block_2/38",
+    "stack_block_0106_xuwang/7",
+    "stack_block_0105_yincheng/56",
+    "stack_block_0105_yincheng/76",
+]
 
 
 def find_match(list, key):

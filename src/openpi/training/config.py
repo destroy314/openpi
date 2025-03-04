@@ -12,6 +12,9 @@ import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
 import tyro
+import numpy as np
+from lerobot.common.datasets.utils import load_info
+from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
 
 import openpi.models.model as _model
 import openpi.models.pi0 as pi0
@@ -62,7 +65,7 @@ class AssetsConfig:
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
-    repo_id: str | None = None
+    repo_id: str| list[str] | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -304,8 +307,11 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
     use_delta_joint_actions: bool = True
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
-    # If true, assume the dataset don't contains left arm cam images
-    right_only: bool = True
+    # Probability replace the action and prompt with "stop", don't set when compute_norm_stats
+    halt_injection_prob: float = 0.0
+    # Whether to inverse the wrist image for mixed single-dual arm training
+    inverse_wrist: bool = False
+    padding: int = 0
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=_transforms.Group())
@@ -315,24 +321,24 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
     def __post_init__(self):
         images = {
             "cam_high": "observation.images.cam_high",
+            "cam_left_wrist": "observation.images.cam_left_wrist",
             "cam_right_wrist": "observation.images.cam_right_wrist",
         }
-        if not self.right_only:
-            images.update({"cam_left_wrist": "observation.images.cam_left_wrist"})
+        # 将convert_airbot_data_to_lerobot.py中保存的key(这个dict的value)变换为AirbotInputs.__call__使用的key(这个dict的key)
+        repack_dict = {
+            "images": images,
+            "state": "observation.state",
+            "actions": "action",
+        }
+        if self.default_prompt is None:
+            repack_dict["prompt"] = "prompt"
         object.__setattr__(
             self,
             "repack_transforms",
             _transforms.Group(
                 inputs=[
-                    # 将convert_airbot_data_to_lerobot.py中保存的key(这个dict的value)变换为AirbotInputs.__call__使用的key(这个dict的key)
                     _transforms.RepackTransform(
-                        {
-                            "images": images,
-                            "state": "observation.state",
-                            "actions": "action",
-                            "prompt": "prompt",
-                            # "right_only": "right_only",
-                        }
+                        repack_dict
                     )
                 ]
             ),
@@ -341,7 +347,7 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[airbot_policy.AirbotInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=[airbot_policy.AirbotInputs(action_dim=model_config.action_dim, model_type=model_config.model_type, halt_injection_prob=self.halt_injection_prob, inverse_wrist=self.inverse_wrist)],
             outputs=[airbot_policy.AirbotOutputs()],
         )
         if self.use_delta_joint_actions:
@@ -351,6 +357,9 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
+        if self.default_prompt and isinstance(self.repo_id, list):
+            raise ValueError("Using default prompt when using multiple dataset is incorrect.")
+
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         return dataclasses.replace(
@@ -359,8 +368,86 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
-            prompt_from_task=True,
+            prompt_from_task=(self.default_prompt is None),
         )
+    
+    # 处理多数据集时的情况，此时asset_id=repo_id是一个list，norm_stats直接存在assets_base_dir/config_name下
+    def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | list[str] | None) -> dict[str, _transforms.NormStats] | None:
+        if asset_id is None:
+            return None
+        
+        if isinstance(asset_id, list):
+            all_norm_stats = []
+            all_frame_counts = []
+            
+            # Load all norm stats and extract frame counts
+            for asset in asset_id:
+                data_assets_dir = str(assets_dir / asset)
+                stats = _normalize.load(_download.maybe_download(data_assets_dir))
+                
+                # Try to load frame count from the same directory
+                dataset_path = LEROBOT_HOME / asset
+                info = load_info(dataset_path)
+                frame_count = info["total_frames"]
+                    
+                logging.info(f"Loaded norm stats from {data_assets_dir} with {frame_count} frames")
+                all_norm_stats.append(stats)
+                all_frame_counts.append(frame_count)
+            
+            # Aggregate the norm stats
+            data_keys = set()
+            for norm_stat in all_norm_stats:
+                data_keys.update(norm_stat.keys())
+            
+            stats = {}
+            for data_key in data_keys:
+                # Extract relevant stats for this data key
+                relevant_stats = [(stats, count) for stats, count in zip(all_norm_stats, all_frame_counts) 
+                                 if data_key in stats]
+                
+                if not relevant_stats:
+                    continue
+                    
+                # Calculate total frames for this data key
+                total_frames = sum(count for _, count in relevant_stats)
+                
+                # Initialize with the first dataset's stats
+                mean = sum(stats[data_key].mean * (count / total_frames) 
+                          for stats, count in relevant_stats)
+                
+                # Calculate combined standard deviation
+                std = np.sqrt(sum(
+                    (
+                        stats[data_key].std ** 2 + 
+                        (stats[data_key].mean - mean) ** 2
+                    ) * (count / total_frames)
+                    for stats, count in relevant_stats
+                ))
+                
+                # Create new NormStats object
+                stats[data_key] = _transforms.NormStats(
+                    mean=mean,
+                    std=std,
+                    q01=None if any(stats[data_key].q01 is None for stats, _ in relevant_stats) else 
+                        np.minimum.reduce([stats[data_key].q01 for stats, _ in relevant_stats]),
+                    q99=None if any(stats[data_key].q99 is None for stats, _ in relevant_stats) else 
+                        np.maximum.reduce([stats[data_key].q99 for stats, _ in relevant_stats])
+                )
+        else:
+            data_assets_dir = str(assets_dir / asset_id)
+            stats = _normalize.load(_download.maybe_download(data_assets_dir))
+            logging.info(f"Loaded norm stats from {data_assets_dir}")
+
+        if self.padding:
+            for key in stats:
+                stats[key] = _transforms.NormStats(
+                    mean=_transforms.pad_to_dim(stats[key].mean, self.padding),
+                    std=_transforms.pad_to_dim(stats[key].std, self.padding),
+                    q01=_transforms.pad_to_dim(stats[key].q01, self.padding),
+                    q99=_transforms.pad_to_dim(stats[key].q99, self.padding),
+                )
+
+        return stats
 
 
 @dataclasses.dataclass(frozen=True)
@@ -659,13 +746,50 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+    TrainConfig(
+        name="pi0_fast_lora_blocks",
+        model=pi0_fast.Pi0FASTConfig(action_dim=14, paligemma_variant="gemma_2b_lora"),
+        data=LeRobotAirbotDataConfig(
+            repo_id=["destroy314/pick_place","destroy314/stack_block","destroy314/organize_block"],
+            base_config=DataConfig(
+                local_files_only=True,
+            ),
+            halt_injection_prob = 0.02,
+            inverse_wrist = True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=40_000,
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_lora_blocks",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotAirbotDataConfig(
+            repo_id=["destroy314/pick_place","destroy314/stack_block","destroy314/organize_block"],
+            base_config=DataConfig(
+                local_files_only=True,
+            ),
+            halt_injection_prob = 0.02,
+            inverse_wrist = True,
+            padding = 32,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
     # 3090: 26h for 20k steps (bs=16)
     TrainConfig(
         name="pi0_fast_airbot_pick_place_low_mem_finetune",
         model=pi0_fast.Pi0FASTConfig(action_dim=14, paligemma_variant="gemma_2b_lora"),
         data=LeRobotAirbotDataConfig(
             repo_id="destroy314/pick_place",
-            right_only=True,
             assets=AssetsConfig(assets_dir="assets"),
             default_prompt="Pick up the block on the table and place it in the red square area.",
             base_config=DataConfig(

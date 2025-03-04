@@ -49,6 +49,10 @@ class TransformedDataset(Dataset[T_co]):
     def __len__(self) -> int:
         return len(self._dataset)
 
+    @property
+    def num_frames(self) -> int:
+        return len(self._dataset.hf_dataset) if self._dataset.hf_dataset is not None else self._dataset.meta.total_frames
+
 
 class FakeDataset(Dataset):
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
@@ -89,9 +93,14 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, local_files_only=data_config.local_files_only)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
+    if isinstance(repo_id, str):
+        dataset_class = lerobot_dataset.LeRobotDataset
+    else:
+        dataset_class = lerobot_dataset.MultiLeRobotDataset
+    # NOTE here we assume all repos have the same fps.
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id[0] if isinstance(repo_id, list) else repo_id, local_files_only=data_config.local_files_only)
+    dataset = dataset_class(
+        repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
             for key in data_config.action_sequence_keys
@@ -100,7 +109,12 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        if isinstance(repo_id, str):
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        else:
+            for idx, repo_id in enumerate(repo_id):
+                dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, local_files_only=data_config.local_files_only)
+                dataset._datasets[idx] = TransformedDataset(dataset._datasets[idx], [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
 
