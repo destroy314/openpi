@@ -10,11 +10,12 @@ from typing import Any, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
+from lerobot.common.datasets.utils import load_info
+from lerobot.common.datasets.utils import load_tasks
+import numpy as np
 from typing_extensions import override
 import tyro
-import numpy as np
-from lerobot.common.datasets.utils import load_info
-from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
 
 import openpi.models.model as _model
 import openpi.models.pi0 as pi0
@@ -96,6 +97,7 @@ class DataConfig:
 
 
 class GroupFactory(Protocol):
+    @abc.abstractmethod
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         """Create a group."""
 
@@ -338,11 +340,12 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
     use_delta_joint_actions: bool = True
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
-    # Probability replace the action and prompt with "stop", don't set when compute_norm_stats
+    # Whether to randomly choose prompt in TASK_AUGMENTATION, otherwise use the first one.
+    prompt_augmentation: bool = False
+    # Probability replace the action and prompt with "stop", don't set when compute_norm_stats.
     halt_injection_prob: float = 0.0
-    # Whether to inverse the wrist image for mixed single-dual arm training
-    inverse_wrist: bool = False
-    padding: int = 0
+    # If true, will pad the dim of norm_stats to 32, so pi0 could compatible with pi0_fast's norm_stats.
+    padding_stat: bool = False
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=_transforms.Group())
@@ -378,7 +381,14 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[airbot_policy.AirbotInputs(action_dim=model_config.action_dim, model_type=model_config.model_type, halt_injection_prob=self.halt_injection_prob, inverse_wrist=self.inverse_wrist)],
+            inputs=[
+                airbot_policy.AirbotInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    prompt_augmentation=self.prompt_augmentation,
+                    halt_injection_prob=self.halt_injection_prob,
+                )
+            ],
             outputs=[airbot_policy.AirbotOutputs()],
         )
         if self.use_delta_joint_actions:
@@ -401,84 +411,95 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
             prompt_from_task=(self.default_prompt is None),
         )
-    
+
     # 处理多数据集时的情况，此时asset_id=repo_id是一个list，norm_stats直接存在assets_base_dir/config_name下
-    def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | list[str] | None) -> dict[str, _transforms.NormStats] | None:
+    def _load_norm_stats(
+        self, assets_dir: epath.Path, asset_id: str | list[str] | None
+    ) -> dict[str, _transforms.NormStats] | None:
         if asset_id is None:
             return None
-        
-        if isinstance(asset_id, list):
-            all_norm_stats = []
-            all_frame_counts = []
-            
-            # Load all norm stats and extract frame counts
-            for asset in asset_id:
-                data_assets_dir = str(assets_dir / asset)
-                stats = _normalize.load(_download.maybe_download(data_assets_dir))
-                
-                # Try to load frame count from the same directory
-                dataset_path = LEROBOT_HOME / asset
-                info = load_info(dataset_path)
-                frame_count = info["total_frames"]
-                    
-                logging.info(f"Loaded norm stats from {data_assets_dir} with {frame_count} frames")
-                all_norm_stats.append(stats)
-                all_frame_counts.append(frame_count)
-            
-            # Aggregate the norm stats
-            data_keys = set()
-            for norm_stat in all_norm_stats:
-                data_keys.update(norm_stat.keys())
-            
-            stats = {}
-            for data_key in data_keys:
-                # Extract relevant stats for this data key
-                relevant_stats = [(stats, count) for stats, count in zip(all_norm_stats, all_frame_counts) 
-                                 if data_key in stats]
-                
-                if not relevant_stats:
-                    continue
-                    
-                # Calculate total frames for this data key
-                total_frames = sum(count for _, count in relevant_stats)
-                
-                # Initialize with the first dataset's stats
-                mean = sum(stats[data_key].mean * (count / total_frames) 
-                          for stats, count in relevant_stats)
-                
-                # Calculate combined standard deviation
-                std = np.sqrt(sum(
-                    (
-                        stats[data_key].std ** 2 + 
-                        (stats[data_key].mean - mean) ** 2
-                    ) * (count / total_frames)
-                    for stats, count in relevant_stats
-                ))
-                
-                # Create new NormStats object
-                stats[data_key] = _transforms.NormStats(
-                    mean=mean,
-                    std=std,
-                    q01=None if any(stats[data_key].q01 is None for stats, _ in relevant_stats) else 
-                        np.minimum.reduce([stats[data_key].q01 for stats, _ in relevant_stats]),
-                    q99=None if any(stats[data_key].q99 is None for stats, _ in relevant_stats) else 
-                        np.maximum.reduce([stats[data_key].q99 for stats, _ in relevant_stats])
-                )
-        else:
-            data_assets_dir = str(assets_dir / asset_id)
-            stats = _normalize.load(_download.maybe_download(data_assets_dir))
-            logging.info(f"Loaded norm stats from {data_assets_dir}")
 
-        if self.padding:
-            for key in stats:
-                stats[key] = _transforms.NormStats(
-                    mean=_transforms.pad_to_dim(stats[key].mean, self.padding),
-                    std=_transforms.pad_to_dim(stats[key].std, self.padding),
-                    q01=_transforms.pad_to_dim(stats[key].q01, self.padding),
-                    q99=_transforms.pad_to_dim(stats[key].q99, self.padding),
-                )
+        try:
+            if isinstance(asset_id, list):
+                key_stats_map = {"state": [], "actions": []}  # key -> [(task, norm_stats, frame_count)]
 
-        return stats
+                for asset in asset_id:
+                    data_assets_dir = str(assets_dir / asset)
+                    stats = _normalize.load(_download.maybe_download(data_assets_dir))
+
+                    dataset_path = LEROBOT_HOME / asset
+                    info = load_info(dataset_path)
+                    frame_count = info["total_frames"]
+
+                    task = load_tasks(dataset_path)
+                    assert len(task) == 1, f"dataset {asset} has {len(task)} tasks"
+
+                    logging.info(f"Loaded norm stats from {data_assets_dir} with {frame_count} frames")
+
+                    for key in stats:
+                        key_stats_map[key].append((task[0], stats[key], frame_count))
+
+                all_stats = {}
+                for data_key, relevant_stats in key_stats_map.items():
+                    logging.info(f"combine {data_key} from {len(relevant_stats)} datasets:")
+
+                    for task, stat, count in relevant_stats:
+                        logging.info(f"dataset {task} (frame count: {count}):")
+                        logging.info(
+                            f"  mean: {np.array2string(stat[data_key].mean, precision=2, suppress_small=True)}"
+                        )
+                        logging.info(f"  std: {np.array2string(stat[data_key].std, precision=2, suppress_small=True)}")
+                        logging.info(f"  q01: {np.array2string(stat[data_key].q01, precision=2, suppress_small=True)}")
+                        logging.info(f"  q99: {np.array2string(stat[data_key].q99, precision=2, suppress_small=True)}")
+
+                    total_frames = sum(count for _, count in relevant_stats)
+
+                    mean = np.sum(
+                        np.array([stats[data_key].mean * (count / total_frames) for stats, count in relevant_stats]),
+                        axis=0,
+                    )
+                    std = np.sqrt(
+                        np.sum(
+                            [
+                                (stats[data_key].std ** 2 + (stats[data_key].mean - mean) ** 2) * (count / total_frames)
+                                for stats, count in relevant_stats
+                            ]
+                        )
+                    )
+
+                    q01 = np.minimum.reduce([stats[data_key].q01 for stats, _ in relevant_stats])
+                    q99 = np.maximum.reduce([stats[data_key].q99 for stats, _ in relevant_stats])
+
+                    logging.info("after combine:")
+                    logging.info(f"  mean: {np.array2string(mean, precision=2, suppress_small=True)}")
+                    logging.info(f"  std: {np.array2string(std, precision=2, suppress_small=True)}")
+                    logging.info(f"  q01: {np.array2string(q01, precision=2, suppress_small=True)}")
+                    logging.info(f"  q99: {np.array2string(q99, precision=2, suppress_small=True)}")
+
+                    all_stats[data_key] = _transforms.NormStats(
+                        mean=mean,
+                        std=std,
+                        q01=q01,
+                        q99=q99,
+                    )
+            else:
+                data_assets_dir = str(assets_dir / asset_id)
+                all_stats = _normalize.load(_download.maybe_download(data_assets_dir))
+                logging.info(f"Loaded norm stats from {data_assets_dir}")
+
+            if self.padding_stat:
+                for data_key in all_stats:
+                    all_stats[data_key] = _transforms.NormStats(
+                        mean=_transforms.pad_to_dim(all_stats[data_key].mean, 32),
+                        std=_transforms.pad_to_dim(all_stats[data_key].std, 32),
+                        q01=_transforms.pad_to_dim(all_stats[data_key].q01, 32),
+                        q99=_transforms.pad_to_dim(all_stats[data_key].q99, 32),
+                    )
+
+            return all_stats
+        except FileNotFoundError:
+            logging.warning(f"Norm stats not found in {data_assets_dir}, skipping.")
+            return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -786,69 +807,15 @@ _CONFIGS = [
     #
     # Fine-tuning AIRBOT configs.
     #
-    # This is a test config that is used to illustate how train on a custom LeRobot dataset.
-    # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
-    # ~22h on single A800, ~12h on two
+    # Only lora finetuning is used for now, because full parameter require a bigger mixture of data
     TrainConfig(
-        name="pi0_fast_airbot_all",
-        model=pi0_fast.Pi0FASTConfig(action_dim=14),
-        data=LeRobotAirbotDataConfig(
-            repo_id="destroy314/airbot_all",
-            assets=AssetsConfig(assets_dir="assets"),
-            base_config=DataConfig(
-                local_files_only=True,
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=20_000,
-    ),
-    # ~18h on single A800, ~10h on two
-    TrainConfig(
-        name="pi0_fast_lora_airbot_all",
-        model=pi0_fast.Pi0FASTConfig(action_dim=14, paligemma_variant="gemma_2b_lora"),
-        data=LeRobotAirbotDataConfig(
-            repo_id="destroy314/airbot_all",
-            assets=AssetsConfig(assets_dir="assets"),
-            base_config=DataConfig(
-                local_files_only=True,
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=20_000,
-        freeze_filter=pi0_fast.Pi0FASTConfig(
-            paligemma_variant="gemma_2b_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi0_fast_lora_blocks",
-        model=pi0_fast.Pi0FASTConfig(action_dim=14, paligemma_variant="gemma_2b_lora"),
-        data=LeRobotAirbotDataConfig(
-            repo_id=["destroy314/pick_place","destroy314/stack_block","destroy314/organize_block"],
-            base_config=DataConfig(
-                local_files_only=True,
-            ),
-            halt_injection_prob = 0.02,
-            inverse_wrist = True,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=40_000,
-        freeze_filter=pi0_fast.Pi0FASTConfig(
-            paligemma_variant="gemma_2b_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi0_lora_blocks",
+        name="pi0_lora",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotAirbotDataConfig(
-            repo_id=["destroy314/pick_place","destroy314/stack_block","destroy314/organize_block"],
             base_config=DataConfig(
                 local_files_only=True,
             ),
-            halt_injection_prob = 0.02,
-            inverse_wrist = True,
-            padding = 32,
+            padding_stat=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
@@ -858,20 +825,16 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
-    # 3090: 26h for 20k steps (bs=16)
     TrainConfig(
-        name="pi0_fast_airbot_pick_place_low_mem_finetune",
+        name="pi0_fast_lora",
         model=pi0_fast.Pi0FASTConfig(action_dim=14, paligemma_variant="gemma_2b_lora"),
         data=LeRobotAirbotDataConfig(
-            repo_id="destroy314/pick_place",
-            assets=AssetsConfig(assets_dir="assets"),
-            default_prompt="Pick up the block on the table and place it in the red square area.",
             base_config=DataConfig(
-                local_files_only=True,  # Set to True for local-only datasets.
+                local_files_only=True,
+                use_quantile_norm=True,
             ),
-            # use_delta_joint_actions=False, #absolute
+            repo_id="modelbest/to_compute_norm_stats",  # should be overwrite during training
         ),
-        batch_size=16,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=20_000,
         freeze_filter=pi0_fast.Pi0FASTConfig(

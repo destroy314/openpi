@@ -15,7 +15,7 @@ def parse_args():
     )
     parser.add_argument("--time_interval", type=int, default=60, help="Scanning interval in seconds")
     parser.add_argument(
-        "--threshold", type=int, default=10, help="Delete folders with episode numbers less than max_number - threshold"
+        "--threshold", type=int, default=5, help="Delete folders with episode numbers less than max_number - threshold"
     )
     return parser.parse_args()
 

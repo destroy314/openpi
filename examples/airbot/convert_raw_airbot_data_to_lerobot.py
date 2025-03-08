@@ -18,7 +18,6 @@ from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.datasets.push_dataset_to_hub._download_raw import download_raw
 import numpy as np
-import torch
 import tqdm
 import tyro
 
@@ -43,6 +42,15 @@ LEFT_INIT_POS = [
     -1.3498512506484985,
     0,
 ]
+RIGHT_INIT_POS = [
+    -0.05664911866188049,
+    -0.26874953508377075,
+    0.5613412857055664,
+    -1.483367681503296,
+    1.1999313831329346,
+    1.3498512506484985,
+    0,
+]
 # TODO remove hardcoding
 # we set the task name and replace it in AirBotInput during training
 # task prompt will be its first match
@@ -59,15 +67,21 @@ TASKS = {name: name.upper() for name in TASKS}
 RIGHT_ONLY_KEYS = ["pick_place"]
 # INCLUDE_KEYS = ["pick_place"]
 # INCLUDE_KEYS = ["stack_block"]
-INCLUDE_KEYS = ["orgnize_block"]
+# INCLUDE_KEYS = ["orgnize_block"]
+INCLUDE_KEYS = ["fold_towel"]
 EXCLUDE_KEYS = [
     "pick_place_0116_yangz/47",
-    "stack_block_2/38",
-    "stack_block_0106_xuwang/7",
-    "stack_block_0105_yincheng/56",
-    "stack_block_0105_yincheng/76",
+    # "stack_block_2/38", # 看起来没问题 不知道为什么在排除项里
+    "stack_block_0104_tanner/0",  # 图片数量750多于JSON长度220
+    # "stack_block_0105_yincheng/56", # 看起来没问题 不知道为什么在排除项里
+    "stack_block_0105_yincheng/76",  # len(low_dim)=27
+    "stack_block_0106_xuwang/7",  # 缺少low_dim.json
+    "stack_paper_cups/0",  # 图片数量2103多于JSON长度1740
+    "stack_paper_cups/5",  # 图片数量1656多于JSON长度1000
+    "flatten_and_fold_towel/17",  # 图片数量2080多于JSON长度1155
+    "flatten_and_fold_towel/35",  # 图片数量2110多于JSON长度1905
 ]
-
+# 目前还不清楚图片数量更多的原因，为避免与low_dim.json不匹配先排除
 
 def find_match(list, key):
     for item in list:
@@ -85,27 +99,23 @@ def get_task_prompt(name):
     for task in TASKS:
         if task in name:
             return TASKS[task]
-    return None
+    raise ValueError(f"task not found in {name}")
 
 def find_ep_dirs(dir_path):
     result = []
 
     for root, dirs, files in os.walk(dir_path):
+        if INCLUDE_KEYS and not find_key(INCLUDE_KEYS, root):
+            continue
         if "data_recording_info.json" in files:
+            if not get_task_prompt(root):
+                raise ValueError(f"skipped {root} not in TASKS")
+
             for dir_name in dirs:
-                full_dir = str(os.path.join(root, dir_name))
-
-                if INCLUDE_KEYS and not find_key(INCLUDE_KEYS, full_dir):
-                    continue
-
+                full_dir = str(Path(root) / dir_name)
                 if EXCLUDE_KEYS and find_key(EXCLUDE_KEYS, full_dir):
                     print(f"skipped {full_dir} by EXCLUDE_KEYS")
                     continue
-
-                if not get_task_prompt(full_dir):
-                    print(f"skipped {full_dir} not in TASKS")
-                    continue
-
                 result.append(full_dir)
 
     return sorted(result)
@@ -120,14 +130,8 @@ def create_empty_dataset(
     has_effort: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
+    # in left-right order, refer to docs/norm_stats.md
     motors = [
-        "right_waist",
-        "right_shoulder",
-        "right_elbow",
-        "right_forearm_roll",
-        "right_wrist_angle",
-        "right_wrist_rotate",
-        "right_gripper",
         "left_waist",
         "left_shoulder",
         "left_elbow",
@@ -135,6 +139,13 @@ def create_empty_dataset(
         "left_wrist_angle",
         "left_wrist_rotate",
         "left_gripper",
+        "right_waist",
+        "right_shoulder",
+        "right_elbow",
+        "right_forearm_roll",
+        "right_wrist_angle",
+        "right_wrist_rotate",
+        "right_gripper",
     ]
 
     features = {
@@ -230,20 +241,16 @@ def load_raw_episode_data(ep_path):
     gripper_action = np.array(low_dim["action/eef/joint_position"])
 
     if qpos.shape[-1] == 12:
-        # filp to right_arm, right_gripper, left_arm, left_gripper (6,1,6,1)
-        # so the right part is aligned with right arm only data
-        state = np.concatenate([qpos[:, 6:], gripper_pos[:, 1:2], qpos[:, :6], gripper_pos[:, 0:1]], axis=1)
+        state = np.concatenate([qpos[:, :6], gripper_pos[:, 0:1], qpos[:, 6:], gripper_pos[:, 1:2]], axis=1)
         action = np.concatenate(
-            [qaction[:, 6:], gripper_action[:, 1:2], qaction[:, :6], gripper_action[:, 0:1]], axis=1
+            [qaction[:, :6], gripper_action[:, 0:1], qaction[:, 6:], gripper_action[:, 1:2]], axis=1
         )
     elif qpos.shape[-1] == 6:
         # NOTE here assert single arm airbot datasets are right arm
-        state = np.concatenate([qpos, gripper_pos, np.tile(LEFT_INIT_POS, (ep_len, 1))], axis=1)
-        action = np.concatenate([qaction, gripper_action, np.tile(LEFT_INIT_POS, (ep_len, 1))], axis=1)
+        state = np.concatenate([np.tile(LEFT_INIT_POS, (ep_len, 1)), qpos, gripper_pos], axis=1)
+        action = np.concatenate([np.tile(LEFT_INIT_POS, (ep_len, 1)), qaction, gripper_action], axis=1)
     else:
         raise ValueError
-
-    assert state.shape[-1] == action.shape[-1] == 14
 
     velocity = None
     effort = None
@@ -271,7 +278,7 @@ def populate_dataset(
     episodes: list[int] | None = None,
 ) -> LeRobotDataset:
     if episodes is None:
-        episodes = range(len(ep_dirs))
+        episodes = list(range(len(ep_dirs)))
 
     for ep_idx in tqdm.tqdm(episodes):
         ep_path = ep_dirs[ep_idx]

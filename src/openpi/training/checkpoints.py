@@ -69,11 +69,18 @@ def save_state(
         data_config = data_loader.data_config()
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
-            if isinstance(data_config.asset_id, list):
-                asset_id = "_".join(data_config.asset_id)
-            else:
-                asset_id = data_config.asset_id
-            _normalize.save(directory / asset_id, norm_stats)
+            # if isinstance(data_config.asset_id, list):
+            #     datesets = [name.split("/")[-1] for name in data_config.asset_id]
+            #     asset_id = "_".join(datesets)
+            # else:
+            #     asset_id = data_config.asset_id
+            # _normalize.save(directory / asset_id, norm_stats)
+            with open(directory / "datasets.txt", "w") as f:
+                if isinstance(data_config.asset_id, str):
+                    f.write(data_config.asset_id)
+                else:
+                    f.write("\n".join(data_config.asset_id))
+            _normalize.save(directory, norm_stats)
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
@@ -108,9 +115,10 @@ def restore_state(
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
-    if isinstance(asset_id, list):
-        asset_id = "_".join(asset_id)
-    norm_stats_dir = epath.Path(assets_dir) / asset_id
+    # if isinstance(asset_id, list):
+    #     asset_id = "_".join(asset_id)
+    # norm_stats_dir = epath.Path(assets_dir) / asset_id
+    norm_stats_dir = assets_dir
     norm_stats = _normalize.load(norm_stats_dir)
     logging.info(f"Loaded norm stats from {norm_stats_dir}")
     return norm_stats

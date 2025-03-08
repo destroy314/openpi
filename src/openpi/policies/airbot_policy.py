@@ -71,9 +71,6 @@ class AirbotInputs(transforms.DataTransformFn):
     # Probability replace the action with state, and replace the prompt with HALT_COMMANDS.
     halt_injection_prob: float = 0.0
 
-    # If true, the left and right wrist images are swapped, to align with single arm pretraining data like libero.
-    inverse_wrist: bool = False
-
     def __call__(self, data: dict) -> dict:
         mask_padding = self.model_type == _model.ModelType.PI0
 
@@ -97,16 +94,13 @@ class AirbotInputs(transforms.DataTransformFn):
             "left_wrist_0_rgb": "cam_left_wrist",
             "right_wrist_0_rgb": "cam_right_wrist",
         }
-        if self.inverse_wrist:
-            extra_image_names = {
-                "left_wrist_0_rgb": "cam_right_wrist",
-                "right_wrist_0_rgb": "cam_left_wrist",
-            }
         for dest, source in extra_image_names.items():
             if source in in_images:
                 images[dest] = _parse_image(in_images[source])
                 image_masks[dest] = np.True_
             else:
+                raise ValueError(f"source image {source} not found in {in_images}")
+                # TODO add right_only support
                 images[dest] = np.zeros_like(base_image)
                 image_masks[dest] = np.False_ if mask_padding else np.True_
 
