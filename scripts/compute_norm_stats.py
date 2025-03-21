@@ -20,39 +20,21 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
-def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _data_loader.Dataset]:
-    data_config = config.data.create(config.assets_dirs, config.model)
-    if data_config.repo_id is None:
-        raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_dataset(data_config, config.model)
-    dataset = _data_loader.TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
-    )
-    return data_config, dataset
-
-
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
+    data_config.repack_transforms.inputs[0].structure.pop("images")
     if isinstance(data_config.repo_id, str):
         datasets = [data_config.repo_id]
     elif isinstance(data_config.repo_id, list):
-        print("compute norm stats for multiple repos: ", data_config.repo_id)
         datasets = data_config.repo_id
-    else:
-        raise ValueError("Data config must have a repo_id")
+    print(f"compute norm stats for {len(datasets)} repos: {datasets}")
 
     for data_id in datasets:
         print(f"compute norm stats for repo: {data_id}")
         object.__setattr__(data_config, "repo_id", data_id)
 
-        dataset = _data_loader.create_dataset(data_config, config.model)
+        dataset = _data_loader.create_dataset(data_config, config.model, disable_video=True)
         dataset = _data_loader.TransformedDataset(
             dataset,
             [
@@ -62,7 +44,7 @@ def main(config_name: str, max_frames: int | None = None):
                 RemoveStrings(),
             ],
         )
-        
+
         num_frames = len(dataset)
         shuffle = False
 

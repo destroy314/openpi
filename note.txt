@@ -53,6 +53,8 @@ CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com LEROBOT_HOME=/baai-cwm-
 > assets=AssetsConfig(assets_dir="assets"), # 注意没有点
 > 此时统计信息会产生在.assets/HFID/DATASET/norm_stats.json，可以方便的在多个config间共享
 
+CUDA_VISIBLE_DEVICES=0 uv run scripts/fit_fast_tokenizer.py --config-name pi0_fast_lora
+
 微调：
 
 CUDA_VISIBLE_DEVICES=5 XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 uv run scripts/train.py pi0_fast_airbot_pick_place_low_mem_finetune --exp-name=pi0_fast_lora_absolute_airbot_pick_place --overwrite --no-wandb_enabled
@@ -81,7 +83,9 @@ CUDA_VISIBLE_DEVICES=6 uv run scripts/train.py pi0_lora \
 --data.repo_id modelbest/stack_block \
 --exp-name debug --overwrite --no-wandb_enabled
 
-export WANDB_API_KEY=543a96cef34b11ce6e61cd19ed577264a0c51f11
+CUDA_VISIBLE_DEVICES=1 uv run scripts/train.py pi0_fast_lora \
+--data.repo_id modelbest/stack_block \
+--exp-name debug --overwrite --no-wandb_enabled
 
 CUDA_VISIBLE_DEVICES=6,7 uv run scripts/train.py pi0_fast_lora \
 --data.repo_id modelbest/stack_block \
@@ -102,6 +106,14 @@ CUDA_VISIBLE_DEVICES=6,7 uv run scripts/train.py pi0_lora \
 CUDA_VISIBLE_DEVICES=2,3 uv run scripts/train.py pi0_lora \
 --data.repo_id modelbest/stack_paper_cups --exp-name stack_paper_cups \
 --num_train_steps 40000
+
+CUDA_VISIBLE_DEVICES=0,1 uv run scripts/train.py pi0_fast_lora \
+--data.repo_id modelbest/stack_block \
+--exp-name stack_block_t --overwrite
+
+CUDA_VISIBLE_DEVICES=5,6 uv run scripts/train.py pi0_lora \
+--data.repo_id modelbest/stack_block \
+--exp-name stack_block_nfov --overwrite
 
 火山引擎：挂载vePFS和Nas
 WANDB_MODE offline
@@ -143,6 +155,7 @@ TokenizeFASTInputs(tokenizer=<openpi.models.tokenizer.FASTTokenizer object at 0x
 推理：
 
 # in shell 1:
+export HF_ENDPOINT=https://hf-mirror.com
 openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_airbot_pick_place_low_mem_finetune --policy.dir=checkpoints/fast_lora_pick_place_delta_13k
 openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_airbot_pick_place_low_mem_finetune --policy.dir=checkpoints/fast_lora_pick_place_absolute_13k
 openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_lora_airbot_all --policy.dir=checkpoints/fast_lora_airbot_all_20k

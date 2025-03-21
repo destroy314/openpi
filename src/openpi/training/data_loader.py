@@ -85,7 +85,9 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig) -> Dataset:
+def create_dataset(
+    data_config: _config.DataConfig, model_config: _model.BaseModelConfig, disable_video: bool = False
+) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
     if repo_id is None:
@@ -95,7 +97,7 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
 
     if isinstance(repo_id, str):
         dataset_class = lerobot_dataset.LeRobotDataset
-    else:
+    elif isinstance(repo_id, list):
         dataset_class = lerobot_dataset.MultiLeRobotDataset
     # NOTE here we assume all repos have the same fps.
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id[0] if isinstance(repo_id, list) else repo_id, local_files_only=data_config.local_files_only)
@@ -108,11 +110,20 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
         local_files_only=data_config.local_files_only,
     )
 
+    def _disable_video(dataset_meta) -> None:
+        for key, value in dataset_meta.info["features"].items():
+            if value["dtype"] == "video":
+                dataset_meta.info["features"][key]["dtype"] = None
+
     if data_config.prompt_from_task:
         if isinstance(repo_id, str):
+            if disable_video:
+                _disable_video(dataset.meta)
             dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
         else:
             for idx, repo_id in enumerate(repo_id):
+                if disable_video:
+                    _disable_video(dataset._datasets[idx].meta)
                 dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, local_files_only=data_config.local_files_only)
                 dataset._datasets[idx] = TransformedDataset(dataset._datasets[idx], [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 

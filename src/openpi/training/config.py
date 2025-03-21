@@ -108,6 +108,7 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    fast_tokenizer_path: str = "physical-intelligence/fast"
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -129,6 +130,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizeFASTInputs(
                             _tokenizer.FASTTokenizer(
                                 model_config.max_token_len,
+                                self.fast_tokenizer_path,
                             ),
                         ),
                     ],
@@ -136,6 +138,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.ExtractFASTActions(
                             _tokenizer.FASTTokenizer(
                                 model_config.max_token_len,
+                                self.fast_tokenizer_path,
                             ),
                             action_horizon=model_config.action_horizon,
                             action_dim=model_config.action_dim,
@@ -352,6 +355,7 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
 
+    # 过去这么写是为了根据right_only参数设置images的key,现已无必要
     def __post_init__(self):
         images = {
             "cam_high": "observation.images.cam_high",
@@ -401,7 +405,19 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
         if self.default_prompt and isinstance(self.repo_id, list):
             raise ValueError("Using default prompt when using multiple dataset is incorrect.")
 
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        dataset_names = self.repo_id if isinstance(self.repo_id, list) else [self.repo_id]
+        dataset_names = dataset_names[0].split("/")[0] + "/" + "_".join([name.split("/")[1] for name in dataset_names])
+        # check tokenizer.json exist
+        if pathlib.Path(assets_dirs / dataset_names / "tokenizer.json").exists():
+            fast_tokenizer_path = str(assets_dirs / dataset_names)
+            logging.info(f"Loading customized fast tokenizer from {fast_tokenizer_path}")
+        else:
+            fast_tokenizer_path = "physical-intelligence/fast"
+
+        model_transforms = ModelTransformFactory(
+            default_prompt=self.default_prompt,
+            fast_tokenizer_path=fast_tokenizer_path,
+        )(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs),
@@ -412,7 +428,6 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
             prompt_from_task=(self.default_prompt is None),
         )
 
-    # 处理多数据集时的情况，此时asset_id=repo_id是一个list，norm_stats直接存在assets_base_dir/config_name下
     def _load_norm_stats(
         self, assets_dir: epath.Path, asset_id: str | list[str] | None
     ) -> dict[str, _transforms.NormStats] | None:
@@ -833,7 +848,8 @@ _CONFIGS = [
                 local_files_only=True,
                 use_quantile_norm=True,
             ),
-            repo_id="modelbest/to_compute_norm_stats",  # should be overwrite during training
+            # repo_id="modelbest/to_compute_norm_stats_or_fit_fast_tokenizer",  # should be overwrite during training
+            repo_id="modelbest/stack_block",  # should be overwrite during training
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=20_000,

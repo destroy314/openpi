@@ -77,32 +77,37 @@ class AirbotInputs(transforms.DataTransformFn):
         # Get the state. We are padding from 14 to the model action dim.
         state = transforms.pad_to_dim(data["state"], self.action_dim)
 
-        in_images = data["images"]
+        if "images" in data:
+            in_images = data["images"]
 
-        # Assume that base image always exists.
-        base_image = _parse_image(in_images["cam_high"])
+            # Assume that base image always exists.
+            base_image = _parse_image(in_images["cam_high"])
 
-        images = {
-            "base_0_rgb": base_image,
-        }
-        image_masks = {
-            "base_0_rgb": np.True_,
-        }
+            images = {
+                "base_0_rgb": base_image,
+            }
+            image_masks = {
+                "base_0_rgb": np.True_,
+            }
 
-        # Add the extra images.
-        extra_image_names = {
-            "left_wrist_0_rgb": "cam_left_wrist",
-            "right_wrist_0_rgb": "cam_right_wrist",
-        }
-        for dest, source in extra_image_names.items():
-            if source in in_images:
-                images[dest] = _parse_image(in_images[source])
-                image_masks[dest] = np.True_
-            else:
-                raise ValueError(f"source image {source} not found in {in_images}")
-                # TODO add right_only support
-                images[dest] = np.zeros_like(base_image)
-                image_masks[dest] = np.False_ if mask_padding else np.True_
+            # Add the extra images.
+            extra_image_names = {
+                "left_wrist_0_rgb": "cam_left_wrist",
+                "right_wrist_0_rgb": "cam_right_wrist",
+            }
+            for dest, source in extra_image_names.items():
+                if source in in_images:
+                    images[dest] = _parse_image(in_images[source])
+                    image_masks[dest] = np.True_
+                else:
+                    raise ValueError(f"source image {source} not found in {in_images}")
+                    # TODO add right_only support
+                    images[dest] = np.zeros_like(base_image)
+                    image_masks[dest] = np.False_ if mask_padding else np.True_
+        else:
+            # 数据集未加载图像,如计算统计信息时
+            images = None
+            image_masks = None
 
         inputs = {
             "image": images,
@@ -115,13 +120,15 @@ class AirbotInputs(transforms.DataTransformFn):
             actions = np.asarray(data["actions"])
             inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
 
-        if "prompt" in data:
+        if "prompt" in data and data["prompt"].isupper():
             if data["prompt"] not in TASK_AUGMENTATION:
                 raise ValueError(f"prompt should be keys of TASK_AUGMENTATION, got: {data['prompt']}")
             if self.prompt_augmentation:
                 inputs["prompt"] = np.random.choice(TASK_AUGMENTATION[data["prompt"]])
             else:
                 inputs["prompt"] = TASK_AUGMENTATION[data["prompt"]][0]
+        elif "prompt" in data:
+            inputs["prompt"] = data["prompt"]
         else:
             # will get prompt from InjectDefaultPrompt
             pass
