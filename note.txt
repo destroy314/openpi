@@ -44,14 +44,7 @@ CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name pi0_fa
 CUDA_VISIBLE_DEVICES=5 HF_ENDPOINT=https://hf-mirror.com LEROBOT_HOME=/baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot uv run scripts/compute_norm_stats.py --config-name pi0_fast_airbot_all
 
 这会产生.assets/CFGNAME/HFID/DATASET/norm_stats.json，并在微调时使用。对于共享数据集的多个config，可以手动复制对应的统计信息。
-
-> （更新）已弃用。代码已回退到每个config/dataset(s)存一个norm_stats.json，以适配多数据集训练
-> 或者可以做些小修改来方便些
-> 修改compute_norm_stats.py L69为：
-> output_path = config.data.assets.assets_dir + "/" + data_config.repo_id
-> 在每个TrainConfig中的data的初始化参数中添加：
-> assets=AssetsConfig(assets_dir="assets"), # 注意没有点
-> 此时统计信息会产生在.assets/HFID/DATASET/norm_stats.json，可以方便的在多个config间共享
+注意统计数据受config影响，包括是否是delta action、delta时的horizon长度、以及policy中做的处理。确保统计数据的生成和使用一致。
 
 CUDA_VISIBLE_DEVICES=0 uv run scripts/fit_fast_tokenizer.py --config-name pi0_fast_lora
 
@@ -75,6 +68,8 @@ export HF_ENDPOINT=https://hf-mirror.com # already in bashrc
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 # 可能导致NCCL错误，开小一点就行
 
 
+DEBUG RUN:
+
 CUDA_VISIBLE_DEVICES=7 uv run scripts/train.py pi0_fast_lora \
 --data.repo_id modelbest/stack_block \
 --exp-name debug --overwrite --no-wandb_enabled
@@ -83,9 +78,7 @@ CUDA_VISIBLE_DEVICES=6 uv run scripts/train.py pi0_lora \
 --data.repo_id modelbest/stack_block \
 --exp-name debug --overwrite --no-wandb_enabled
 
-CUDA_VISIBLE_DEVICES=1 uv run scripts/train.py pi0_fast_lora \
---data.repo_id modelbest/stack_block \
---exp-name debug --overwrite --no-wandb_enabled
+TRAIN:
 
 CUDA_VISIBLE_DEVICES=6,7 uv run scripts/train.py pi0_fast_lora \
 --data.repo_id modelbest/stack_block \
@@ -95,54 +88,24 @@ CUDA_VISIBLE_DEVICES=4,5 uv run scripts/train.py pi0_lora \
 --data.repo_id modelbest/stack_block \
 --exp-name stack_block --overwrite
 
-CUDA_VISIBLE_DEVICES=2,3 uv run scripts/train.py pi0_fast_lora \
---data.repo_id modelbest/stack_paper_cups \
---exp-name stack_paper_cups --overwrite
+CUDA_VISIBLE_DEVICES=4,5,6,7 uv run scripts/train.py pi0_lora \
+--data.repo_id modelbest/instruct_block_pnp modelbest/stack_block \
+--data.halt_injection_prob 0.02 \
+--num_train_steps 40000 \
+--exp-name mixed_instruct_block_pnp --overwrite
 
-CUDA_VISIBLE_DEVICES=6,7 uv run scripts/train.py pi0_lora \
---data.repo_id modelbest/fold_towel --exp-name fold_towel \
---num_train_steps 40000
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run scripts/train.py pi0_lora \
+--data.repo_id modelbest/instruct_block_pnp modelbest/stack_block \
+--num_train_steps 40000 \
+--exp-name mixed_single_instruct_block_pnp --overwrite
 
-CUDA_VISIBLE_DEVICES=2,3 uv run scripts/train.py pi0_lora \
---data.repo_id modelbest/stack_paper_cups --exp-name stack_paper_cups \
---num_train_steps 40000
-
-CUDA_VISIBLE_DEVICES=0,1 uv run scripts/train.py pi0_fast_lora \
+CUDA_VISIBLE_DEVICES=4,5,6,7 uv run scripts/train.py pi0_lora \
 --data.repo_id modelbest/stack_block \
---exp-name stack_block_t --overwrite
-
-CUDA_VISIBLE_DEVICES=5,6 uv run scripts/train.py pi0_lora \
---data.repo_id modelbest/stack_block \
---exp-name stack_block_nfov --overwrite
-
-火山引擎：挂载vePFS和Nas
-WANDB_MODE offline
-LEROBOT_HOME /baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot
-XLA_PYTHON_CLIENT_MEM_FRACTION 0.99
-HF_ENDPOINT https://hf-mirror.com
-
-cd /baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/yangzhuo/openpi
-/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/miniconda3/bin/uv run scripts/train.py pi0_fast_lora_airbot_all --exp-name=pi0_fast_lora_airbot_all --checkpoint-base-dir=/baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints --weight-loader.params-path=/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/openpi-assets/checkpoints/pi0_fast_base/params --overwrite
-
-cd /baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/yangzhuo/openpi
-/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/miniconda3/bin/uv run scripts/train.py pi0_fast_airbot_all --exp-name=pi0_fast_airbot_all --checkpoint-base-dir=/baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints --weight-loader.params-path=/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/openpi-assets/checkpoints/pi0_fast_base/params --overwrite
-
-/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/miniconda3/bin/uv run scripts/train.py pi0_fast_lora_blocks --exp-name=horizon_len_inv --checkpoint-base-dir=/baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints --weight-loader.params-path=/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/openpi-assets/checkpoints/pi0_fast_base/params --model.action-horizon=25 --model.max-token-len 300 --batch_size=16 --overwrite
-
-/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/miniconda3/bin/uv run scripts/train.py pi0_lora_blocks --exp-name=horizon_inv --checkpoint-base-dir=/baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints --weight-loader.params-path=/baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/.cache/openpi/openpi-assets/checkpoints/pi0_base/params --model.action-horizon=25 --batch_size=16 --overwrite
-
-chmod -R 777 /baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints
-chmod -R 777 /baai-cwm-1/baai_cwm_ml/algorithm/zongzheng.zhang/yangzhuo/openpi/wandb
+--num_train_steps 80000 \
+--exp-name mixed_single_instruct_block_pnp --resume
 
 
-cd /baai-cwm-nas/algorithm/zongzheng.zhang/yangzhuo/checkpoints/
-cd pi0_fast_lora_airbot_all/pi0_fast_lora_airbot/
-tar -cvf pi0_fast_lora_all_20k.tar --exclude="*/train_state" 19999
-tosutil cp pi0_fast_lora_all_20k.tar tos://baai-cwm-bucket-01/pi0/
-rm pi0_fast_lora_all_20k.tar
-tosutil cp tos://baai-cwm-bucket-01/pi0/pi0_fast_lora_all_20k.tar .
-
-训练时：
+训练时的transforms：
 PromptFromLeRobotTask   (if data_config.prompt_from_task)
 RepackTransform(structure={'images': {'cam_high': 'observation.images.cam_high', 'cam_right_wrist': 'observation.images.cam_right_wrist'}, 'state': 'observation.state', 'actions': ('action',)}), 
 AirbotInputs(action_dim=14, model_type=<ModelType.PI0_FAST: 'pi0_fast'>, prompt_augmentation=False, halt_injection_prob=0.0), 
@@ -151,6 +114,7 @@ Normalize()
 InjectDefaultPrompt(prompt='Pick up the block on the table and place it in the red square area.'), 
 ResizeImages(height=224, width=224),
 TokenizeFASTInputs(tokenizer=<openpi.models.tokenizer.FASTTokenizer object at 0x732504fc9750>)
+
 
 推理：
 

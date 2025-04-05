@@ -150,7 +150,7 @@ class ModelTransformFactory(GroupFactory):
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
-    repo_id: str = tyro.MISSING
+    repo_id: str | list[str] = tyro.MISSING
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -436,7 +436,8 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
 
         try:
             if isinstance(asset_id, list):
-                key_stats_map = {"state": [], "actions": []}  # key -> [(task, norm_stats, frame_count)]
+                # 多数据集训练，合并对应的统计数据
+                key_stats_map = {"state": [], "actions": []}  # key -> [(dataset_name, norm_stats, frame_count), ...]
 
                 for asset in asset_id:
                     data_assets_dir = str(assets_dir / asset)
@@ -446,44 +447,42 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
                     info = load_info(dataset_path)
                     frame_count = info["total_frames"]
 
-                    task = load_tasks(dataset_path)
-                    assert len(task) == 1, f"dataset {asset} has {len(task)} tasks"
-
                     logging.info(f"Loaded norm stats from {data_assets_dir} with {frame_count} frames")
 
                     for key in stats:
-                        key_stats_map[key].append((task[0], stats[key], frame_count))
+                        key_stats_map[key].append((asset, stats[key], frame_count))
 
                 all_stats = {}
                 for data_key, relevant_stats in key_stats_map.items():
                     logging.info(f"combine {data_key} from {len(relevant_stats)} datasets:")
 
-                    for task, stat, count in relevant_stats:
-                        logging.info(f"dataset {task} (frame count: {count}):")
+                    for name, stat, count in relevant_stats:
+                        logging.info(f"dataset {name} (frame count: {count}):")
                         logging.info(
-                            f"  mean: {np.array2string(stat[data_key].mean, precision=2, suppress_small=True)}"
+                            f"  mean: {np.array2string(stat.mean, precision=2, suppress_small=True)}"
                         )
-                        logging.info(f"  std: {np.array2string(stat[data_key].std, precision=2, suppress_small=True)}")
-                        logging.info(f"  q01: {np.array2string(stat[data_key].q01, precision=2, suppress_small=True)}")
-                        logging.info(f"  q99: {np.array2string(stat[data_key].q99, precision=2, suppress_small=True)}")
+                        logging.info(f"  std: {np.array2string(stat.std, precision=2, suppress_small=True)}")
+                        logging.info(f"  q01: {np.array2string(stat.q01, precision=2, suppress_small=True)}")
+                        logging.info(f"  q99: {np.array2string(stat.q99, precision=2, suppress_small=True)}")
 
-                    total_frames = sum(count for _, count in relevant_stats)
+                    total_frames = sum(count for _, _, count in relevant_stats)
 
                     mean = np.sum(
-                        np.array([stats[data_key].mean * (count / total_frames) for stats, count in relevant_stats]),
+                        np.array([stats.mean * (count / total_frames) for _, stats, count in relevant_stats]),
                         axis=0,
                     )
                     std = np.sqrt(
                         np.sum(
                             [
-                                (stats[data_key].std ** 2 + (stats[data_key].mean - mean) ** 2) * (count / total_frames)
-                                for stats, count in relevant_stats
-                            ]
+                                (stats.std ** 2 + (stats.mean - mean) ** 2) * (count / total_frames)
+                                for _, stats, count in relevant_stats
+                            ],
+                            axis=0,
                         )
                     )
 
-                    q01 = np.minimum.reduce([stats[data_key].q01 for stats, _ in relevant_stats])
-                    q99 = np.maximum.reduce([stats[data_key].q99 for stats, _ in relevant_stats])
+                    q01 = np.minimum.reduce([stats.q01 for _, stats, _ in relevant_stats])
+                    q99 = np.maximum.reduce([stats.q99 for _, stats, _ in relevant_stats])
 
                     logging.info("after combine:")
                     logging.info(f"  mean: {np.array2string(mean, precision=2, suppress_small=True)}")
@@ -830,6 +829,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 local_files_only=True,
             ),
+            repo_id="modelbest/to_compute_norm_stats_or_fit_fast_tokenizer",  # should be overwrite during training
             padding_stat=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
@@ -848,8 +848,7 @@ _CONFIGS = [
                 local_files_only=True,
                 use_quantile_norm=True,
             ),
-            # repo_id="modelbest/to_compute_norm_stats_or_fit_fast_tokenizer",  # should be overwrite during training
-            repo_id="modelbest/stack_block",  # should be overwrite during training
+            repo_id="modelbest/to_compute_norm_stats_or_fit_fast_tokenizer",  # should be overwrite during training
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=20_000,
