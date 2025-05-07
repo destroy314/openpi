@@ -122,7 +122,7 @@ TokenizeFASTInputs(tokenizer=<openpi.models.tokenizer.FASTTokenizer object at 0x
 export HF_ENDPOINT=https://hf-mirror.com
 openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_airbot_pick_place_low_mem_finetune --policy.dir=checkpoints/fast_lora_pick_place_delta_13k
 openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_airbot_pick_place_low_mem_finetune --policy.dir=checkpoints/fast_lora_pick_place_absolute_13k
-openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_lora_airbot_all --policy.dir=checkpoints/fast_lora_airbot_all_20k
+openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_lora_abs --policy.dir=checkpoints/door
 # in shell 2:
 Imitate-All$ python pi0_evaluate_client.py [--right]
 uv run examples/simple_client/main.py --env ALOHA # for test
