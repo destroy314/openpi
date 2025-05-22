@@ -17,12 +17,13 @@ import cv2
 import numpy as np
 import tqdm
 import tyro
+import json
 import bson # uv pip install pymongo
 import av
 
-from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
+LEROBOT_HOME = Path(os.getenv("LEROBOT_HOME", "~/.cache/huggingface/lerobot")).expanduser()
 
 @dataclasses.dataclass(frozen=True)
 class DatasetConfig:
@@ -34,56 +35,6 @@ class DatasetConfig:
 
 
 DEFAULT_DATASET_CONFIG = DatasetConfig()
-
-# Default positions for left and right arms
-LEFT_INIT_POS = [
-    -0.05664911866188049,
-    -0.26874953508377075,
-    0.5613412857055664,
-    1.483367681503296,
-    -1.1999313831329346,
-    -1.3498512506484985,
-    0,
-]
-RIGHT_INIT_POS = [
-    -0.05664911866188049,
-    -0.26874953508377075,
-    0.5613412857055664,
-    -1.483367681503296,
-    1.1999313831329346,
-    1.3498512506484985,
-    0,
-]
-
-# Task mapping
-TASKS = [
-    "debug",
-]
-TASKS = {name: name.upper() for name in TASKS}
-
-
-def find_match(list_items, key):
-    """Find an item in a list that contains the key."""
-    for item in list_items:
-        if key in item:
-            return item
-    return None
-
-
-def find_key(key_list, s):
-    """Find a key in a list that is contained in the string s."""
-    for key in key_list:
-        if key in s:
-            return key
-    return None
-
-
-def get_task_prompt(name):
-    """Get the task prompt from the task name."""
-    for task in TASKS:
-        if task in name:
-            return TASKS[task]
-    raise ValueError(f"task not found in {name}")
 
 
 def find_bson_dirs(dir_path):
@@ -154,6 +105,20 @@ def create_empty_dataset(
                 motors,
             ],
         },
+        "observation.velocity": {
+            "dtype": "float32",
+            "shape": (len(motors),),
+            "names": [
+                motors,
+            ],
+        },
+        "observation.effort": {
+            "dtype": "float32",
+            "shape": (len(motors),),
+            "names": [
+                motors,
+            ],
+        },
         "action": {
             "dtype": "float32",
             "shape": (len(motors),),
@@ -161,6 +126,14 @@ def create_empty_dataset(
                 motors,
             ],
         },
+        # 当前task还有几帧结束（包括当前帧）
+        "task_len": {
+            "dtype": "int32",
+            "shape": (1,),
+            "names": [
+                "len"
+            ]
+        }
     }
 
     if has_velocity:
@@ -264,6 +237,59 @@ def extract_images_from_bson(bson_data):
     return {k: np.array(v) for k, v in imgs_per_cam.items()}
 
 
+class DefaultPrompt:
+    """A class that returns the default prompt for any index."""
+    def __init__(self, default_prompt):
+        self.default_prompt = default_prompt
+    
+    def __getitem__(self, index):
+        return self.default_prompt
+
+class LongTaskLen:
+    def __getitem__(self, index):
+        return 1000 # longer than any action horizon
+
+def extract_task_prompt(additional_file, ep_idx, default_prompt):
+    """Extract task prompt from bson data.
+    
+    Args:
+        additional_file: Path to the additional.json file
+        ep_idx: Episode index/key in the additional data
+        default_prompt: Default prompt to use if no task prompts are available
+    
+    Returns:
+        A list of task prompts for each frame or a DefaultPrompt object
+    """
+    # Try to load additional data
+    additional_data = None
+    if additional_file.exists():
+        with open(additional_file, 'r') as f:
+            additional_data_all = json.load(f)
+        if ep_idx in additional_data_all:
+            additional_data = additional_data_all[ep_idx]
+    
+    # If no additional data, return default prompt
+    if additional_data is None:
+        print(f"use default prompt {default_prompt} for ep {ep_idx}, not exist")
+        return DefaultPrompt(default_prompt)#, LongTaskLen()
+    
+    split_frame_indices = additional_data.get("marked_frames", [])
+    task_promts = additional_data.get("task_prompts", [])
+    
+    # Create a list to hold the task prompts for each frame
+    task_prompt = []
+    task_len = []
+    start_idx = -1
+    for task_idx, end_idx in enumerate(split_frame_indices):
+        # Get the task prompt for the current segment
+        current_task_prompt = task_promts[task_idx]
+        task_prompt.extend([current_task_prompt] * (end_idx - start_idx))
+        task_len.extend(list(range(end_idx - start_idx, 0, -1)))
+        start_idx = end_idx
+    
+    return task_prompt, task_len
+
+
 def extract_state_and_action_from_bson(bson_data):
     """Extract state and action data from bson data."""
     # Find arm and eef keys
@@ -295,31 +321,28 @@ def extract_state_and_action_from_bson(bson_data):
     frame_num = len(bson_data["data"][left_obs_arm_key])
     
     # Initialize state and action arrays
-    state = np.zeros((frame_num, 14))  # 14 motors (7 for each arm)
-    action = np.zeros((frame_num, 14))
+    state = np.zeros((frame_num, 14), dtype=np.float32)  # 14 motors (7 for each arm)
+    velocity = np.zeros((frame_num, 14), dtype=np.float32)
+    effort = np.zeros((frame_num, 14), dtype=np.float32)
     
-    # Extract joint positions and gripper data
+    action = np.zeros((frame_num, 14), dtype=np.float32)
+    
+    for modality, name in zip([state, velocity, effort], ["pos", "vel", "eff"]):
+        # Extract joint positions and gripper data
+        for i in range(frame_num):
+            # Extract joint positions for left arm observation
+            modality[i, 0:6] = bson_data["data"][left_obs_arm_key][i]["data"][name]
+            
+            # Extract joint positions for right arm observation
+            modality[i, 7:13] = bson_data["data"][right_obs_arm_key][i]["data"][name]
+            
+            # Extract gripper position for left arm observation
+            modality[i, 6:7] = bson_data["data"][left_obs_eef_key][i]["data"][name]
+
+            # Extract gripper position for right arm observation
+            modality[i, 13:14] = bson_data["data"][right_obs_eef_key][i]["data"][name]
+            
     for i in range(frame_num):
-        # Extract joint positions for left arm observation
-        state[i, 0:6] = bson_data["data"][left_obs_arm_key][i]["data"]["pos"]
-        
-        # Extract joint positions for right arm observation
-        state[i, 7:13] = bson_data["data"][right_obs_arm_key][i]["data"]["pos"]
-        
-        # Extract gripper position for left arm observation
-        gripper_data = bson_data["data"][left_obs_eef_key][i]["data"]["t"]
-        if isinstance(gripper_data, list):
-            state[i, 6] = gripper_data[0]
-        else:
-            state[i, 6] = gripper_data
-        
-        # Extract gripper position for right arm observation
-        gripper_data = bson_data["data"][right_obs_eef_key][i]["data"]["t"]
-        if isinstance(gripper_data, list):
-            state[i, 13] = gripper_data[0]
-        else:
-            state[i, 13] = gripper_data
-        
         # Extract joint positions for left arm action
         action[i, 0:6] = bson_data["data"][left_act_arm_key][i]["data"]["pos"]
         
@@ -327,48 +350,43 @@ def extract_state_and_action_from_bson(bson_data):
         action[i, 7:13] = bson_data["data"][right_act_arm_key][i]["data"]["pos"]
         
         # Extract gripper position for left arm action
-        gripper_data = bson_data["data"][left_act_eef_key][i]["data"]["t"]
-        if isinstance(gripper_data, list):
-            action[i, 6] = gripper_data[0]
-        else:
-            action[i, 6] = gripper_data
+        action[i, 6:7] = bson_data["data"][left_act_eef_key][i]["data"]["pos"]
         
         # Extract gripper position for right arm action
-        gripper_data = bson_data["data"][right_act_eef_key][i]["data"]["t"]
-        if isinstance(gripper_data, list):
-            action[i, 13] = gripper_data[0]
-        else:
-            action[i, 13] = gripper_data
+        action[i, 13:14] = bson_data["data"][right_act_eef_key][i]["data"]["pos"]
     
-    return state, action
+    return state, velocity, effort, action
 
 
-def load_bson_episode_data(ep_path):
+def load_bson_episode_data(ep_path, default_prompt):
     """Load episode data from a bson file."""
     bson_file = Path(ep_path) / "data.bson"
-    if not bson_file.exists():
-        raise FileNotFoundError(f"BSON file not found at {bson_file}")
+    additional_file = Path(ep_path).parent / "additional.json"
     
     # Load bson data
     bson_data = load_bson(bson_file)
-    
+
     # Extract images
     imgs_per_cam = extract_images_from_bson(bson_data)
     
     # Extract state and action
-    state, action = extract_state_and_action_from_bson(bson_data)
+    state, velocity, effort, action = extract_state_and_action_from_bson(bson_data)
     
-    # We don't have velocity and effort data in the bson files
-    velocity = None
-    effort = None
+    # Get episode index from path
+    ep_idx = ep_path.split("/")[-1]
     
-    return imgs_per_cam, state, action, velocity, effort
+    # Get task prompt
+    task_prompt, task_len = extract_task_prompt(additional_file, ep_idx, default_prompt)
+    
+    return imgs_per_cam, state, velocity, effort, action, task_prompt, task_len
 
 
 def populate_dataset(
     dataset: LeRobotDataset,
     ep_dirs,
     episodes: list[int] | None = None,
+    default_prompt: str = "do something",
+    pad_end_len: int = 0,
 ) -> LeRobotDataset:
     """Populate the dataset with episode data."""
     if episodes is None:
@@ -377,31 +395,34 @@ def populate_dataset(
     for ep_idx in tqdm.tqdm(episodes):
         ep_path = ep_dirs[ep_idx]
         
-        # Get task prompt
-        task_prompt = get_task_prompt(os.path.basename(os.path.dirname(ep_path)))
-        
         # Load episode data
-        imgs_per_cam, state, action, velocity, effort = load_bson_episode_data(ep_path)
+        imgs_per_cam, state, velocity, effort, action, task_prompt, task_len = load_bson_episode_data(
+            ep_path, default_prompt=default_prompt
+        )
         num_frames = state.shape[0]
         
         for i in range(num_frames):
-            frame = {
+            current_frame_data = {
                 "observation.state": state[i],
+                "observation.velocity": velocity[i],
+                "observation.effort": effort[i],
                 "action": action[i],
+                "task": task_prompt[i],
+                "task_len": np.array([task_len[i]], dtype=np.int32),
             }
             
             for camera, img_array in imgs_per_cam.items():
-                frame[f"observation.images.{camera}"] = img_array[i]
+                current_frame_data[f"observation.images.{camera}"] = img_array[i]
             
-            if velocity is not None:
-                frame["observation.velocity"] = velocity[i]
-            if effort is not None:
-                frame["observation.effort"] = effort[i]
-            
-            dataset.add_frame(frame)
-        
-        dataset.save_episode(task=task_prompt)
-    
+            dataset.add_frame(current_frame_data)
+
+            # Pad frames if it's the end of a task segment and pad_end_len > 0
+            if task_len[i] == 1 and pad_end_len > 0:
+                padding_frame_data = current_frame_data.copy()
+                for _ in range(pad_end_len):
+                    dataset.add_frame(padding_frame_data)
+
+        dataset.save_episode()
     return dataset
 
 
@@ -413,6 +434,8 @@ def convert_bson_to_lerobot(
     push_to_hub: bool = False,
     mode: Literal["video", "image"] = "video",
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
+    default_prompt: str = "do something",
+    pad_end_len: int = 0,
 ):
     """Convert bson data to lerobot format.
     
@@ -423,6 +446,9 @@ def convert_bson_to_lerobot(
         push_to_hub: Whether to push the dataset to the hub
         mode: Whether to save images as videos or individual images
         dataset_config: Configuration for the dataset
+        default_prompt: Default prompt to use when no task description is available
+        pad_end_len: Number of frames to pad at the end of each task. Padded frames
+                     will have the same content as the task's last frame, with task_len=1.
     
     Returns:
         The created lerobot dataset
@@ -434,6 +460,22 @@ def convert_bson_to_lerobot(
     if not ep_dirs:
         raise ValueError(f"No episode directories found in {bson_dir}")
     
+    additional_file = Path(ep_dirs[0]) / ".." / "additional.json"
+    # Check additional data if it exists
+    if additional_file.exists():
+        with open(additional_file, 'r') as f:
+            additional_data = json.load(f)
+        for key in additional_data.keys():
+            split_frame_indices = additional_data[key]["marked_frames"]
+            task_prompts = additional_data[key]["task_prompts"]
+            if len(split_frame_indices) != len(task_prompts):
+                print(f"Warning: Mismatch between number of splitting frames and task prompts for ep {key}: {len(split_frame_indices)} vs {len(task_prompts)}")
+            if not all(task_prompts):
+                print(f"Warning: Missing task_promts for ep {key}: {task_prompts}")
+    else:
+        print(f"Note: Additional data file not found at {additional_file}")
+        print(f"Will use default task prompt for all frames: '{default_prompt}'")
+    
     # Create empty dataset
     dataset = create_empty_dataset(
         repo_id=repo_id,
@@ -444,9 +486,13 @@ def convert_bson_to_lerobot(
     )
     
     # Populate dataset
-    dataset = populate_dataset(dataset, ep_dirs, episodes)
-
-    dataset.consolidate(run_compute_stats=False)
+    dataset = populate_dataset(
+        dataset,
+        ep_dirs,
+        episodes,
+        default_prompt=default_prompt,
+        pad_end_len=pad_end_len
+    )
     
     # Push to hub if requested
     if push_to_hub:

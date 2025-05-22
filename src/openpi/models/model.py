@@ -141,6 +141,7 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    remove_state_joints: tuple[int, ...] = (),
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
@@ -189,11 +190,16 @@ def preprocess_observation(
             out_masks[key] = jnp.ones(batch_shape, dtype=jnp.bool)
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
+    
+    state = observation.state.copy()
+    for i in remove_state_joints:
+        state = state.at[:, i].set(jnp.zeros_like(state[:, i]))
+        state = state.at[:, 7+i].set(jnp.zeros_like(state[:, 7+i]))
 
     return Observation(
         images=out_images,
         image_masks=out_masks,
-        state=observation.state,
+        state=state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

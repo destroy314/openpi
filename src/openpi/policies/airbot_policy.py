@@ -35,19 +35,10 @@ TASK_AUGMENTATION = {
 }
 
 HALT_COMMANDS = [
-    "halt",
     "stop moving",
-    "hold still",
+    # "halt",
+    # "hold still",
 ]
-
-
-def _parse_image(image) -> np.ndarray:
-    image = np.asarray(image)
-    if np.issubdtype(image.dtype, np.floating):
-        image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
-        image = einops.rearrange(image, "c h w -> h w c")
-    return image
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,6 +62,34 @@ class AirbotInputs(transforms.DataTransformFn):
     # Probability replace the action with state, and replace the prompt with HALT_COMMANDS.
     halt_injection_prob: float = 0.0
 
+    # Pad action after task prompt changed according to task_len
+    # |   task m    |     task n   |
+    #       |action horizon|
+    #               | pad  |
+    pad_action: bool = False
+
+    # Crop input image into square for siglip input are square
+    crop_img_square: bool = False
+
+    # Probability mask the wrist cam to enforce the model use front cam
+    mask_wrist_cam_prob: float = 0.0
+
+    def parse_image(self, image) -> np.ndarray:
+        image = np.asarray(image)
+        if np.issubdtype(image.dtype, np.floating):
+            image = (255 * image).astype(np.uint8)
+        if image.shape[0] == 3:
+            image = einops.rearrange(image, "c h w -> h w c")
+
+        if self.crop_img_square:
+            h, w, _ = image.shape
+            assert w > h
+            left = (w - h) // 2
+            right = left + h
+            image = image[:, left:right, :]
+
+        return image
+
     def __call__(self, data: dict) -> dict:
         mask_padding = self.model_type == _model.ModelType.PI0
 
@@ -81,7 +100,7 @@ class AirbotInputs(transforms.DataTransformFn):
             in_images = data["images"]
 
             # Assume that base image always exists.
-            base_image = _parse_image(in_images["cam_high"])
+            base_image = self.parse_image(in_images["cam_high"])
 
             images = {
                 "base_0_rgb": base_image,
@@ -96,12 +115,10 @@ class AirbotInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": "cam_right_wrist",
             }
             for dest, source in extra_image_names.items():
-                if source in in_images:
-                    images[dest] = _parse_image(in_images[source])
+                if np.random.uniform() > self.mask_wrist_cam_prob:
+                    images[dest] = self.parse_image(in_images[source])
                     image_masks[dest] = np.True_
                 else:
-                    raise ValueError(f"source image {source} not found in {in_images}")
-                    # TODO add right_only support
                     images[dest] = np.zeros_like(base_image)
                     image_masks[dest] = np.False_ if mask_padding else np.True_
         else:
@@ -129,6 +146,8 @@ class AirbotInputs(transforms.DataTransformFn):
                 inputs["prompt"] = TASK_AUGMENTATION[data["prompt"]][0]
         elif "prompt" in data:
             inputs["prompt"] = data["prompt"]
+            if self.pad_action and "actions" in inputs and data["task_len"] + 1 < inputs["actions"].shape[0]:
+                inputs["actions"][data["task_len"] + 1:] = inputs["actions"][data["task_len"]]
         else:
             # will get prompt from InjectDefaultPrompt
             pass

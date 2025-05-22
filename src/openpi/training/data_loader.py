@@ -100,14 +100,14 @@ def create_dataset(
     elif isinstance(repo_id, list):
         dataset_class = lerobot_dataset.MultiLeRobotDataset
     # NOTE here we assume all repos have the same fps.
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id[0] if isinstance(repo_id, list) else repo_id, local_files_only=data_config.local_files_only)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id[0] if isinstance(repo_id, list) else repo_id)
     dataset = dataset_class(
         repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
             for key in data_config.action_sequence_keys
         },
-        local_files_only=data_config.local_files_only,
+        video_backend="pyav",
     )
 
     def _disable_video(dataset_meta) -> None:

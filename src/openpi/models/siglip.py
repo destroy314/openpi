@@ -81,7 +81,7 @@ class Encoder1DBlock(nn.Module):
     dtype_mm: str = "float32"
 
     @nn.compact
-    def __call__(self, x, deterministic=True):  # noqa: FBT002
+    def __call__(self, x, lang_emb=None, deterministic=True):  # noqa: FBT002
         out = {}
         x = sharding.activation_sharding_constraint(x)
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
@@ -94,6 +94,12 @@ class Encoder1DBlock(nn.Module):
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
         x = out["+sa"] = x + y
+
+        if lang_emb is not None:
+            lang_emb = nn.LayerNorm(dtype=self.dtype_mm, name="film_lang_emb_norm")(lang_emb)
+            gamma = nn.Dense(x.shape[-1], dtype=self.dtype_mm, name="film_scale")(lang_emb)[:, None, :]
+            beta = nn.Dense(x.shape[-1], dtype=self.dtype_mm, name="film_shift")(lang_emb)[:, None, :]
+            x = out["+lang"] = x * (1 + gamma) + beta
 
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
         y = out["mlp"] = MlpBlock(
@@ -120,14 +126,14 @@ class Encoder(nn.Module):
     dtype_mm: str = "float32"
 
     @nn.compact
-    def __call__(self, x, deterministic=True):  # noqa: FBT002
+    def __call__(self, x, lang_emb=None, deterministic=True):  # noqa: FBT002
         out = {}
 
         if self.scan:
             block = nn.remat(
                 Encoder1DBlock,
                 prevent_cse=False,
-                static_argnums=(2,),  # 0=self, 2=deterministic
+                static_argnums=(2, 3),  # 0=self, 2=lang_emb, 3=deterministic
                 policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
             )
             x, scan_out = nn.scan(
@@ -142,7 +148,7 @@ class Encoder(nn.Module):
                 mlp_dim=self.mlp_dim,
                 num_heads=self.num_heads,
                 dropout=self.dropout,
-            )(x, deterministic)
+            )(x, lang_emb, deterministic)
             for lyr in range(self.depth):
                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
         else:
@@ -155,7 +161,7 @@ class Encoder(nn.Module):
                     num_heads=self.num_heads,
                     dropout=self.dropout,
                 )
-                x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
+                x, out[f"block{lyr:02d}"] = block_cur(x, lang_emb, deterministic)
             out["pre_ln"] = x  # Alias for last block, but without the number in it.
 
         return nn.LayerNorm(name="encoder_norm", dtype=self.dtype_mm)(x), out
@@ -205,7 +211,7 @@ class _Module(nn.Module):
     dtype_mm: str = "float32"
 
     @nn.compact
-    def __call__(self, image, *, train=False):
+    def __call__(self, image, lang_emb=None, *, train=False):
         out = {}
 
         # Kevin edit: do patch extraction and posemb in float32,
@@ -247,7 +253,7 @@ class _Module(nn.Module):
             remat_policy=self.remat_policy,
             dtype_mm=self.dtype_mm,
             name="Transformer",
-        )(x, deterministic=not train)
+        )(x, lang_emb, deterministic=not train)
         encoded = out["encoded"] = x
 
         if self.pool_type == "map":

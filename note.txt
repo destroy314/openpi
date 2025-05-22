@@ -1,8 +1,13 @@
+uv sync已经基本上坏了。现在的环境配置流程是在别的地方克隆lerobot repo，注释对rerun-sdk的依赖（如果机器的glibc版本不够高），然后uv add ../lerobot
+兼容性：在 openpi/.venv/lib64/python3.11/site-packages/lerobot/common/datasets/lerobot_dataset.py 添加一行 LEROBOT_HOME = Path(os.getenv("LEROBOT_HOME", "~/.cache/huggingface/lerobot")).expanduser()
+
 转换数据集：
 
 export PATH=~/yangzhuo/ffmpeg-7.0.2-amd64-static:${PATH}
 export LEROBOT_HOME=/baai-cwm-1/baai_cwm_ml/public_data/scenes/pi0/lerobot
 
+uv run examples/airbot/convert_bson_to_lerobot.py --bson_dir data/raw/door --repo_id modelbest/door --default_prompt "open the door"
+uv run examples/airbot/convert_bson_to_lerobot.py --bson_dir data/raw/blocks58mm --repo_id modelbest/blocks58mm3 --pad_end_len 40
 uv run examples/airbot/convert_airbot_data_to_lerobot.py --raw_dir datasets/pick_place --repo_id HFID/DATASET --no-push-to-hub
 uv run examples/airbot/convert_raw_airbot_data_to_lerobot.py --raw_dir data/raw --repo_id modelbest/stack_block --no-push-to-hub
 uv run examples/airbot/remove_cache_images.py --root_folder data/lerobot/destroy314/airbot_all/images #因为lerobot在转换完后才会删除图片😅
@@ -123,6 +128,8 @@ export HF_ENDPOINT=https://hf-mirror.com
 openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_airbot_pick_place_low_mem_finetune --policy.dir=checkpoints/fast_lora_pick_place_delta_13k
 openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_airbot_pick_place_low_mem_finetune --policy.dir=checkpoints/fast_lora_pick_place_absolute_13k
 openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_lora_abs --policy.dir=checkpoints/door
+openpi$ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_lora_airbot_all --policy.dir=checkpoints/fast_lora_airbot_all_20k
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=eval_pi0_lora_crop_remove_joint_1 --policy.dir=checkpoints/pi0_lora/blocks58mm3/29999
 # in shell 2:
 Imitate-All$ python pi0_evaluate_client.py [--right]
 uv run examples/simple_client/main.py --env ALOHA # for test

@@ -7,10 +7,11 @@ import difflib
 import logging
 import pathlib
 from typing import Any, Protocol, TypeAlias
+import os
+from pathlib import Path
 
 import etils.epath as epath
 import flax.nnx as nnx
-from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
 from lerobot.common.datasets.utils import load_info
 from lerobot.common.datasets.utils import load_tasks
 import numpy as np
@@ -35,6 +36,7 @@ ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
 
+LEROBOT_HOME = Path(os.getenv("LEROBOT_HOME", "~/.cache/huggingface/lerobot")).expanduser()
 
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
@@ -343,12 +345,15 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
     use_delta_joint_actions: bool = True
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
-    # Whether to randomly choose prompt in TASK_AUGMENTATION, otherwise use the first one.
-    prompt_augmentation: bool = False
-    # Probability replace the action and prompt with "stop", don't set when compute_norm_stats.
-    halt_injection_prob: float = 0.0
     # If true, will pad the dim of norm_stats to 32, so pi0 could compatible with pi0_fast's norm_stats.
     padding_stat: bool = False
+
+    # Refer to AirbotInputs
+    prompt_augmentation: bool = False
+    halt_injection_prob: float = 0.0
+    pad_action: bool = False
+    crop_img_square: bool = False
+    mask_wrist_cam_prob: float = 0.0
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=_transforms.Group())
@@ -370,6 +375,8 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
         }
         if self.default_prompt is None:
             repack_dict["prompt"] = "prompt"
+        if self.pad_action:
+            repack_dict["task_len"] = "task_len"
         object.__setattr__(
             self,
             "repack_transforms",
@@ -391,6 +398,9 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
                     model_type=model_config.model_type,
                     prompt_augmentation=self.prompt_augmentation,
                     halt_injection_prob=self.halt_injection_prob,
+                    pad_action=self.pad_action,
+                    crop_img_square=self.crop_img_square,
+                    mask_wrist_cam_prob=self.mask_wrist_cam_prob,
                 )
             ],
             outputs=[airbot_policy.AirbotOutputs()],
@@ -563,7 +573,7 @@ class TrainConfig:
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
-    keep_period: int | None = 5000
+    keep_period: int | None = 10000
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -829,7 +839,33 @@ _CONFIGS = [
             base_config=DataConfig(
                 local_files_only=True,
             ),
-            repo_id="modelbest/to_compute_norm_stats_or_fit_fast_tokenizer",  # should be overwrite during training
+            # repo_id="modelbest/to_compute_norm_stats",  # should be overwrite during training
+            # repo_id="modelbest/grocery_shopping",
+            # repo_id="modelbest/telephoto_blocks",
+            repo_id="modelbest/blocks58mm3",
+            # repo_id="modelbest/grocery_shopping_12",
+            padding_stat=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_lora_abs",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotAirbotDataConfig(
+            base_config=DataConfig(
+                local_files_only=True,
+            ),
+            # repo_id="modelbest/to_compute_norm_stats",  # should be overwrite during training
+            # repo_id="modelbest/grocery_shopping",
+            # repo_id="modelbest/door",
+            repo_id="modelbest/desktop",
+            use_delta_joint_actions=False,
             padding_stat=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
@@ -875,6 +911,24 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
         ).get_freeze_filter(),
         ema_decay=None,
+    ),
+    TrainConfig(
+        name="eval_pi0_lora_crop_remove_joint_1",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+                            remove_state_joints=(1,)),
+        data=LeRobotAirbotDataConfig(
+            base_config=DataConfig(),
+            crop_img_square=True,
+        ),
+    ),
+    TrainConfig(
+        name="eval_pi0_lora_crop_remove_joint_1_film",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+                            remove_state_joints=(1,), use_film=True),
+        data=LeRobotAirbotDataConfig(
+            base_config=DataConfig(),
+            crop_img_square=True,
+        ),
     ),
     #
     # Debugging configs.
