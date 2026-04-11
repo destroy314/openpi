@@ -19,6 +19,15 @@ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_droid 
 
 This will start a policy server that will serve the policy specified by the `config` and `dir` arguments. The policy will be served on the specified port (default: 8000).
 
+Airbot uses the same policy server, but there is intentionally no built-in `--env AIRBOT` default checkpoint because Airbot deployments are expected to use user-trained checkpoints. Start the server explicitly with the checkpoint and config:
+
+```bash
+uv run scripts/serve_policy.py \
+  policy:checkpoint \
+  --policy.config=pi05_airbot_rlt \
+  --policy.dir=/path/to/your/pi05_airbot_rlt_checkpoint
+```
+
 ## Querying the remote policy server from your robot code
 
 We provide a client utility with minimal dependencies that you can easily embed into any robot codebase.
@@ -69,3 +78,19 @@ for step in range(num_steps):
 ```
 
 Here, the `host` and `port` arguments specify the IP address and port of the remote policy server. You can also specify these as command-line arguments to your robot code, or hard-code them in your robot codebase. The `observation` is a dictionary of observations and the prompt, following the specification of the policy inputs for the policy you are serving. We have concrete examples of how to construct this dictionary for different environments in the [simple client example](../examples/simple_client/main.py).
+
+For Airbot checkpoints, the observation schema matches the Airbot transform exactly:
+
+```python
+observation = {
+    "state": state_14d,  # shape (14,)
+    "images": {
+        "cam_high": cam_high_uint8_chw,
+        "cam_left_wrist": cam_left_wrist_uint8_chw,
+        "cam_right_wrist": cam_right_wrist_uint8_chw,
+    },
+    "prompt": task_instruction,
+}
+```
+
+The server returns `actions` with shape `(action_horizon, 14)`. The current `pi05_airbot_rlt` config uses `action_horizon=10`, so the returned chunk is `(10, 14)`.

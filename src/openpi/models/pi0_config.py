@@ -33,12 +33,22 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
+    use_rlt: bool = False
+    rlt_actor_enabled: bool = False
+    rlt_recon_weight: float = 1.0
+    rlt_bc_weight: float = 1.0
+    rlt_token_dim: int = 256
+    rlt_token_depth: int = 2
+    rlt_actor_hidden_dim: int = 256
+    rlt_reference_dropout: float = 0.5
 
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.use_rlt and not self.pi05:
+            raise ValueError("RLT is only supported for PI0.5 configs.")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",

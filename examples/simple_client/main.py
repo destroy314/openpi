@@ -11,6 +11,8 @@ import rich
 import tqdm
 import tyro
 
+from openpi.policies import airbot_policy as _airbot_policy
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,6 +21,7 @@ class EnvMode(enum.Enum):
 
     ALOHA = "aloha"
     ALOHA_SIM = "aloha_sim"
+    AIRBOT = "airbot"
     DROID = "droid"
     LIBERO = "libero"
 
@@ -118,6 +121,7 @@ def main(args: Args) -> None:
     obs_fn = {
         EnvMode.ALOHA: _random_observation_aloha,
         EnvMode.ALOHA_SIM: _random_observation_aloha,
+        EnvMode.AIRBOT: _random_observation_airbot,
         EnvMode.DROID: _random_observation_droid,
         EnvMode.LIBERO: _random_observation_libero,
     }[args.env]
@@ -171,6 +175,10 @@ def _random_observation_droid() -> dict:
         "observation/gripper_position": np.random.rand(1),
         "prompt": "do something",
     }
+
+
+def _random_observation_airbot() -> dict:
+    return _airbot_policy.make_airbot_example()
 
 
 def _random_observation_libero() -> dict:

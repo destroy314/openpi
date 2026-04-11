@@ -18,6 +18,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.airbot_policy as airbot_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
@@ -272,6 +273,70 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotAirbotDataConfig(DataConfigFactory):
+    """Airbot data config that reuses only the hardware-facing schema and transforms."""
+
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+
+    # Refer to AirbotInputs for the augmentation options below.
+    prompt_augmentation: bool = False
+    halt_injection_prob: float = 0.0
+    pad_action: bool = False
+    crop_img_square: bool = False
+    mask_wrist_cam_prob: float = 0.0
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_dict: dict[str, Any] = {
+            "images": {
+                "cam_high": "observation.images.cam_high",
+                "cam_left_wrist": "observation.images.cam_left_wrist",
+                "cam_right_wrist": "observation.images.cam_right_wrist",
+            },
+            "state": "observation.state",
+            "actions": "action",
+        }
+        if self.default_prompt is None:
+            repack_dict["prompt"] = "prompt"
+        if self.pad_action:
+            repack_dict["task_len"] = "task_len"
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                airbot_policy.AirbotInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    prompt_augmentation=self.prompt_augmentation,
+                    halt_injection_prob=self.halt_injection_prob,
+                    pad_action=self.pad_action,
+                    crop_img_square=self.crop_img_square,
+                    mask_wrist_cam_prob=self.mask_wrist_cam_prob,
+                )
+            ],
+            outputs=[airbot_policy.AirbotOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(repack_dict)]),
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
@@ -917,6 +982,68 @@ _CONFIGS = [
         batch_size=32,
     ),
     #
+    # Airbot RLT configs.
+    #
+    TrainConfig(
+        name="pi05_airbot_rlt_token",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_rlt=True,
+            rlt_actor_enabled=False,
+        ),
+        data=LeRobotAirbotDataConfig(
+            repo_id="your_hf_username/my_airbot_dataset",
+            assets=AssetsConfig(asset_id="airbot"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_rlt=True,
+        ).get_freeze_filter(),
+        batch_size=32,
+        num_train_steps=20_000,
+        ema_decay=None,
+        policy_metadata={"robot": "airbot", "action_dim": 14, "action_horizon": 10},
+    ),
+    TrainConfig(
+        # This config defines the deployable PI05-RLT model shape and Airbot transforms.
+        # Use it with scripts/train_rlt_online.py rather than the standard train.py entrypoint.
+        name="pi05_airbot_rlt",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_rlt=True,
+            rlt_actor_enabled=True,
+        ),
+        data=LeRobotAirbotDataConfig(
+            repo_id="your_hf_username/my_airbot_dataset",
+            assets=AssetsConfig(asset_id="airbot"),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_rlt=True,
+            rlt_actor_enabled=True,
+        ).get_freeze_filter(),
+        batch_size=32,
+        ema_decay=None,
+        policy_metadata={"robot": "airbot", "action_dim": 14, "action_horizon": 10},
+    ),
+    #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
     TrainConfig(
@@ -964,6 +1091,25 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_pi05_rlt",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=14,
+            action_horizon=10,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            use_rlt=True,
+            rlt_actor_enabled=True,
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_pi05_rlt",
+        wandb_enabled=False,
+        ema_decay=None,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

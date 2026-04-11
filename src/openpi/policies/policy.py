@@ -64,11 +64,22 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
+    def prepare_inputs(self, obs: dict) -> dict:
+        """Apply the input transform stack without batching or model inference."""
+        inputs = jax.tree.map(lambda x: x, obs)
+        return self._input_transform(inputs)
+
+    def prepare_observation(self, obs: dict) -> tuple[dict, _model.Observation]:
+        """Prepare transformed inputs plus a batched Observation for JAX models."""
+        if self._is_pytorch_model:
+            raise NotImplementedError("prepare_observation is only supported for JAX policies.")
+        inputs = self.prepare_inputs(obs)
+        batched_inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        return inputs, _model.Observation.from_dict(batched_inputs)
+
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
-        # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, obs)
-        inputs = self._input_transform(inputs)
+        inputs = self.prepare_inputs(obs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -108,6 +119,10 @@ class Policy(BasePolicy):
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+    @property
+    def model(self) -> _model.BaseModel:
+        return self._model
 
 
 class PolicyRecorder(_base_policy.BasePolicy):
