@@ -39,10 +39,27 @@ HALT_COMMANDS = [
 ]
 
 
+def _expand_airbot_state(state: np.ndarray) -> np.ndarray:
+    state = np.asarray(state, dtype=np.float32)
+    state_dim = state.shape[-1]
+    if state_dim in {14, 32}:
+        return state
+    raise ValueError(f"Airbot prompt state must have 14 or 32 dims, got {state_dim}")
+
+
+def _expand_airbot_proprio(proprio: np.ndarray) -> np.ndarray:
+    proprio = np.asarray(proprio, dtype=np.float32)
+    proprio_dim = proprio.shape[-1]
+    if proprio_dim in {28, 32}:
+        return proprio
+    raise ValueError(f"Airbot proprio must have 28 or 32 dims, got {proprio_dim}")
+
+
 def make_airbot_example() -> dict:
     """Creates a random observation for the Airbot policy."""
     return {
         "state": np.ones((14,), dtype=np.float32),
+        "proprio": np.concatenate([np.ones((14,), dtype=np.float32), np.zeros((14,), dtype=np.float32)]),
         "images": {
             "cam_high": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
             "cam_left_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
@@ -75,6 +92,7 @@ class AirbotInputs(transforms.DataTransformFn):
 
     action_dim: int
     model_type: _model.ModelType = _model.ModelType.PI05
+    require_proprio: bool = False
     prompt_augmentation: bool = False
     halt_injection_prob: float = 0.0
     pad_action: bool = False
@@ -85,7 +103,14 @@ class AirbotInputs(transforms.DataTransformFn):
         return np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_
 
     def __call__(self, data: dict) -> dict:
-        state = transforms.pad_to_dim(np.asarray(data["state"]), self.action_dim)
+        prompt_state = _expand_airbot_state(np.asarray(data["state"]))
+        proprio = data.get("proprio")
+        if proprio is None:
+            if self.require_proprio:
+                raise ValueError("Airbot proprio is required when require_proprio=True.")
+            state = transforms.pad_to_dim(prompt_state, self.action_dim)
+        else:
+            state = transforms.pad_to_dim(_expand_airbot_proprio(np.asarray(proprio)), self.action_dim)
 
         in_images = data.get("images", {})
         base_image = (
@@ -113,6 +138,7 @@ class AirbotInputs(transforms.DataTransformFn):
             "image": images,
             "image_mask": image_masks,
             "state": state,
+            "prompt_state": prompt_state,
         }
 
         if "actions" in data:

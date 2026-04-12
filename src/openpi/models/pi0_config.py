@@ -39,6 +39,8 @@ class Pi0Config(_model.BaseModelConfig):
     rlt_bc_weight: float = 1.0
     rlt_token_dim: int = 256
     rlt_token_depth: int = 2
+    rlt_action_horizon: int | None = None
+    rlt_env_action_dim: int | None = None
     rlt_actor_hidden_dim: int = 256
     rlt_reference_dropout: float = 0.5
 
@@ -47,8 +49,20 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.rlt_action_horizon is None:
+            object.__setattr__(self, "rlt_action_horizon", self.action_horizon)
+        if self.rlt_env_action_dim is None:
+            object.__setattr__(self, "rlt_env_action_dim", self.action_dim)
         if self.use_rlt and not self.pi05:
             raise ValueError("RLT is only supported for PI0.5 configs.")
+        if self.rlt_action_horizon > self.action_horizon:
+            raise ValueError(
+                f"rlt_action_horizon ({self.rlt_action_horizon}) must be <= action_horizon ({self.action_horizon})"
+            )
+        if self.rlt_env_action_dim > self.action_dim:
+            raise ValueError(
+                f"rlt_env_action_dim ({self.rlt_env_action_dim}) must be <= action_dim ({self.action_dim})"
+            )
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",

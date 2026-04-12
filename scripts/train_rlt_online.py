@@ -126,9 +126,14 @@ def _compute_features(
     return state, reference
 
 
-def _actor_action(policy_state, state: np.ndarray, reference_action: np.ndarray) -> np.ndarray:
+def _actor_action(policy_state, rng: jax.Array, state: np.ndarray, reference_action: np.ndarray) -> np.ndarray:
     model = nnx.merge(policy_state.model_def, policy_state.params)
-    action = _trainer.actor_mean(model, jnp.asarray(state)[None, ...], jnp.asarray(reference_action)[None, ...])
+    action = _trainer.actor_sample(
+        model,
+        jnp.asarray(state)[None, ...],
+        jnp.asarray(reference_action)[None, ...],
+        rng,
+    )
     return np.asarray(action[0], dtype=np.float32)
 
 
@@ -145,6 +150,69 @@ def _extract_step_rewards(reward: float, info: dict[str, Any], requested_steps: 
     if not rewards:
         raise ValueError("info['step_rewards'] must contain at least one reward.")
     return [float(x) for x in rewards]
+
+
+def _extract_executed_actions(
+    info: dict[str, Any],
+    *,
+    executed_steps: int,
+    fallback_actions: np.ndarray,
+) -> np.ndarray:
+    executed_actions = info.get("executed_actions")
+    fallback = np.asarray(fallback_actions, dtype=np.float32)
+    if fallback.ndim != 2:
+        raise ValueError(f"fallback_actions must be rank-2, got shape {fallback.shape}")
+    if executed_actions is None:
+        return fallback[:executed_steps].copy()
+    actions = np.asarray(executed_actions, dtype=np.float32)
+    if actions.ndim != 2:
+        raise ValueError(f"info['executed_actions'] must be rank-2, got shape {actions.shape}")
+    if actions.shape[0] != executed_steps:
+        raise ValueError(
+            f"info['executed_actions'] length ({actions.shape[0]}) must match executed_steps ({executed_steps})"
+        )
+    if actions.shape[1] != fallback.shape[1]:
+        raise ValueError(
+            f"info['executed_actions'] width ({actions.shape[1]}) must match env action width ({fallback.shape[1]})"
+        )
+    return actions.copy()
+
+
+def _extract_intervened_mask(info: dict[str, Any], *, executed_steps: int) -> np.ndarray:
+    intervened_mask = info.get("intervened_mask")
+    if intervened_mask is None:
+        return np.zeros((executed_steps,), dtype=bool)
+    mask = np.asarray(intervened_mask, dtype=bool).reshape(-1)
+    if mask.shape[0] != executed_steps:
+        raise ValueError(f"info['intervened_mask'] length ({mask.shape[0]}) must match executed_steps ({executed_steps})")
+    return mask.copy()
+
+
+def _patch_chunk_with_executed_prefix(
+    chunk: PlannedChunk,
+    *,
+    executed_actions: np.ndarray,
+    intervened_mask: np.ndarray,
+    action_horizon: int,
+    action_dim: int,
+    env_action_dim: int,
+) -> None:
+    if executed_actions.ndim != 2 or executed_actions.shape[1] != env_action_dim:
+        raise ValueError(f"executed_actions must have shape (steps, {env_action_dim}), got {executed_actions.shape}")
+    if intervened_mask.shape != (executed_actions.shape[0],):
+        raise ValueError(
+            f"intervened_mask must have shape ({executed_actions.shape[0]},), got {intervened_mask.shape}"
+        )
+
+    action_chunk = np.asarray(chunk.action, dtype=np.float32).reshape(action_horizon, action_dim).copy()
+    reference_chunk = np.asarray(chunk.reference_action, dtype=np.float32).reshape(action_horizon, action_dim).copy()
+
+    action_chunk[: executed_actions.shape[0], :env_action_dim] = executed_actions
+    if np.any(intervened_mask):
+        reference_chunk[: executed_actions.shape[0], :env_action_dim][intervened_mask] = executed_actions[intervened_mask]
+
+    chunk.action = action_chunk.reshape(-1)
+    chunk.reference_action = reference_chunk.reshape(-1)
 
 
 def _discounted_return(reward_history: list[float], start_step: int, horizon: int, discount: float) -> float:
@@ -204,9 +272,11 @@ def main(args: Args) -> None:
     train_config = _config.get_config(args.config)
     if not getattr(train_config.model, "use_rlt", False):
         raise ValueError(f"Config {args.config} must enable use_rlt=True.")
-    if train_config.model.action_horizon % args.chunk_stride != 0:
+    online_action_horizon = getattr(train_config.model, "rlt_action_horizon", train_config.model.action_horizon)
+    online_env_action_dim = getattr(train_config.model, "rlt_env_action_dim", train_config.model.action_dim)
+    if online_action_horizon % args.chunk_stride != 0:
         raise ValueError(
-            f"chunk_stride ({args.chunk_stride}) must divide action_horizon ({train_config.model.action_horizon})"
+            f"chunk_stride ({args.chunk_stride}) must divide online RLT action horizon ({online_action_horizon})"
         )
 
     checkpoint_root, resuming = _checkpointing.initialize_checkpoint_dir(
@@ -293,14 +363,15 @@ def main(args: Args) -> None:
                 reward_history,
                 replay,
                 current_step=current_step,
-                action_horizon=train_config.model.action_horizon,
+                action_horizon=online_action_horizon,
                 discount=args.online.discount,
             )
 
             if current_step < args.warmup_steps:
                 action = reference_action
             else:
-                action = _actor_action(policy_state, state, reference_action)
+                rng, actor_sample_rng = jax.random.split(rng)
+                action = _actor_action(policy_state, actor_sample_rng, state, reference_action)
             pending_chunks.append(
                 PlannedChunk(
                     step=current_step,
@@ -310,11 +381,23 @@ def main(args: Args) -> None:
                 )
             )
 
-            executed_chunk = action.reshape(train_config.model.action_horizon, train_config.model.action_dim)[
-                : args.chunk_stride, :14
-            ]
+            executed_chunk = action.reshape(online_action_horizon, online_env_action_dim)[: args.chunk_stride]
             next_observation, reward, done, info = _step_env(env, executed_chunk)
             step_rewards = _extract_step_rewards(reward, info, args.chunk_stride)
+            executed_actions = _extract_executed_actions(
+                info,
+                executed_steps=len(step_rewards),
+                fallback_actions=executed_chunk,
+            )
+            intervened_mask = _extract_intervened_mask(info, executed_steps=len(step_rewards))
+            _patch_chunk_with_executed_prefix(
+                pending_chunks[-1],
+                executed_actions=executed_actions,
+                intervened_mask=intervened_mask,
+                action_horizon=online_action_horizon,
+                action_dim=online_env_action_dim,
+                env_action_dim=executed_chunk.shape[-1],
+            )
             reward_history.extend(step_rewards)
             current_step += len(step_rewards)
 
@@ -335,7 +418,7 @@ def main(args: Args) -> None:
                     reward_history,
                     replay,
                     current_step=current_step,
-                    action_horizon=train_config.model.action_horizon,
+                    action_horizon=online_action_horizon,
                     discount=args.online.discount,
                     terminal=True,
                     terminal_features=terminal_features,
@@ -344,11 +427,13 @@ def main(args: Args) -> None:
             if len(replay) >= args.batch_size and current_step >= args.warmup_steps:
                 for _ in range(args.utd_ratio):
                     batch = _to_jax_batch(replay.sample(args.batch_size, rng=np_rng))
+                    rng, critic_rng = jax.random.split(rng)
                     critic_state, critic_info = _trainer.critic_step(
                         critic_model,
                         critic_state,
                         policy_state,
                         batch,
+                        critic_rng,
                         args.online,
                     )
                     metrics.append({k: float(np.asarray(v)) for k, v in critic_info.items()})
@@ -416,7 +501,7 @@ def main(args: Args) -> None:
                 reward_history,
                 replay,
                 current_step=current_step,
-                action_horizon=train_config.model.action_horizon,
+                action_horizon=online_action_horizon,
                 discount=args.online.discount,
             )
             _flush_ready_chunks(
@@ -425,7 +510,7 @@ def main(args: Args) -> None:
                 reward_history,
                 replay,
                 current_step=current_step,
-                action_horizon=train_config.model.action_horizon,
+                action_horizon=online_action_horizon,
                 discount=args.online.discount,
                 terminal=True,
                 terminal_features=final_features,

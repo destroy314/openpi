@@ -30,6 +30,14 @@ def _make_attn_mask(query_mask: jax.Array, key_mask: jax.Array) -> jax.Array:
     return jnp.logical_and(query_mask[:, :, None], key_mask[:, None, :])[:, None, :, :]
 
 
+def _make_causal_attn_mask(query_mask: jax.Array, key_mask: jax.Array) -> jax.Array:
+    query_len = query_mask.shape[1]
+    key_len = key_mask.shape[1]
+    causal = jnp.tril(jnp.ones((query_len, key_len), dtype=jnp.bool_))
+    valid = jnp.logical_and(query_mask[:, :, None], key_mask[:, None, :])
+    return jnp.logical_and(valid[:, None, :, :], causal[None, None, :, :])
+
+
 class FeedForwardBlock(nn.Module):
     hidden_dim: int
     mlp_dim: int
@@ -101,6 +109,7 @@ class RLTokenModule(nn.Module):
     def __call__(self, prefix_embeddings: jax.Array, prefix_mask: jax.Array) -> tuple[jax.Array, jax.Array]:
         hidden_dim = self.hidden_dim or self.token_dim
         seq_len = prefix_embeddings.shape[1]
+        stopped_prefix = jax.lax.stop_gradient(prefix_embeddings)
 
         prefix_inputs = nn.Dense(hidden_dim, name="encoder_input_proj")(prefix_embeddings)
         encoder_pos = _sinusoidal_positions(seq_len + 1, hidden_dim, prefix_inputs.dtype)
@@ -127,9 +136,10 @@ class RLTokenModule(nn.Module):
         rl_token = nn.Dense(self.token_dim, name="token_proj")(nn.LayerNorm(name="token_ln")(encoder_tokens[:, -1]))
 
         memory = nn.Dense(hidden_dim, name="decoder_memory_proj")(rl_token)[:, None, :]
-        decoder_tokens = jnp.broadcast_to(memory, (prefix_inputs.shape[0], seq_len, hidden_dim))
+        shifted_targets = jnp.concatenate([memory, stopped_prefix[:, :-1]], axis=1)
+        decoder_tokens = nn.Dense(hidden_dim, name="decoder_input_proj")(shifted_targets)
         decoder_tokens = decoder_tokens + _sinusoidal_positions(seq_len, hidden_dim, decoder_tokens.dtype)[None, :, :]
-        decoder_self_mask = _make_attn_mask(prefix_mask, prefix_mask)
+        decoder_self_mask = _make_causal_attn_mask(prefix_mask, prefix_mask)
         decoder_cross_mask = _make_attn_mask(prefix_mask, jnp.ones((prefix_mask.shape[0], 1), dtype=jnp.bool_))
         for layer in range(self.depth):
             decoder_tokens = DecoderBlock(

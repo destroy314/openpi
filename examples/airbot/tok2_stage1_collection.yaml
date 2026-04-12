@@ -1,0 +1,47 @@
+robot:
+  type: airbot_TOK2_follower
+  port: can0
+  id: airbot_TOK2_follower
+  cameras:
+    cam_high:
+      type: opencv
+      index_or_path: "/dev/video0"
+      width: 640
+      height: 480
+      fps: 30
+      rotation: NO_ROTATION
+    cam_left_wrist:
+      type: opencv
+      index_or_path: "/dev/video2"
+      width: 640
+      height: 480
+      fps: 30
+      rotation: NO_ROTATION
+    cam_right_wrist:
+      type: opencv
+      index_or_path: "/dev/video4"
+      width: 640
+      height: 480
+      fps: 30
+      rotation: NO_ROTATION
+
+teleop:
+  type: airbot_TOK2_leader
+  port: can1
+  id: airbot_TOK2_leader
+
+run:
+  fps: 30
+  display_data: true
+  num_episodes: 50
+  episode_time_sec: 40
+  reset_time_sec: 30
+  single_task: "place the object into the target area"
+
+dataset:
+  repo_id: your_hf_username/airbot_tok2_pick_place_raw
+  video: true
+  num_image_writer_processes: 0
+  num_image_writer_threads_per_camera: 4
+  video_encoding_batch_size: 1
+  push_to_hub: false

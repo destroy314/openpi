@@ -30,12 +30,7 @@ class GaussianActor(nn.Module):
         features = jnp.concatenate([state, reference_action], axis=-1)
         delta = MLP(self.action_dim, hidden_dim=self.hidden_dim, num_layers=self.num_layers)(features)
         mean = reference_action + delta
-        log_std = self.param(
-            "log_std",
-            lambda key, shape: jnp.full(shape, jnp.log(self.init_std), dtype=jnp.float32),
-            (self.action_dim,),
-        )
-        std = jnp.broadcast_to(jnp.exp(log_std), mean.shape)
+        std = jnp.full(mean.shape, self.init_std, dtype=mean.dtype)
         return mean, std
 
 
@@ -59,4 +54,3 @@ class TwinCritic(nn.Module):
         q1 = Critic(hidden_dim=self.hidden_dim, num_layers=self.num_layers, name="q1")(state, action)
         q2 = Critic(hidden_dim=self.hidden_dim, num_layers=self.num_layers, name="q2")(state, action)
         return q1, q2
-

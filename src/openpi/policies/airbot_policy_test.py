@@ -20,6 +20,8 @@ def test_airbot_inputs_outputs_round_trip():
 
     outputs = airbot_policy.AirbotOutputs()({"actions": inputs["actions"]})
     assert outputs["actions"].shape == (10, 14)
+    np.testing.assert_allclose(inputs["state"][:28], example["proprio"])
+    np.testing.assert_allclose(inputs["prompt_state"], example["state"])
 
 
 def test_airbot_inputs_handles_missing_images():
@@ -36,6 +38,20 @@ def test_airbot_inputs_handles_missing_images():
     assert not inputs["image_mask"]["base_0_rgb"]
     assert not inputs["image_mask"]["left_wrist_0_rgb"]
     assert not inputs["image_mask"]["right_wrist_0_rgb"]
+    np.testing.assert_allclose(inputs["state"][:14], np.ones((14,), dtype=np.float32))
+    np.testing.assert_allclose(inputs["prompt_state"], np.ones((14,), dtype=np.float32))
+
+
+def test_airbot_inputs_requires_proprio_when_requested():
+    transform = airbot_policy.AirbotInputs(action_dim=32, require_proprio=True)
+
+    with np.testing.assert_raises_regex(ValueError, "proprio is required"):
+        transform(
+            {
+                "state": np.ones((14,), dtype=np.float32),
+                "prompt": "do something",
+            }
+        )
 
 
 def test_policy_prepare_observation_for_airbot():

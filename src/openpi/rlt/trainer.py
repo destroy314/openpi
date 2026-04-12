@@ -83,15 +83,31 @@ def actor_mean(model, state: jax.Array, reference_action: jax.Array) -> jax.Arra
     return mean
 
 
+def actor_sample(
+    model,
+    state: jax.Array,
+    reference_action: jax.Array,
+    rng: jax.Array,
+    *,
+    deterministic: bool = False,
+) -> jax.Array:
+    mean, std = model.rlt_actor(state, reference_action)
+    if deterministic:
+        return mean
+    noise = jax.random.normal(rng, mean.shape, dtype=mean.dtype)
+    return mean + noise * std
+
+
 def critic_step(
     critic_model: _actor_critic.TwinCritic,
     critic_state: CriticTrainState,
     policy_state: training_utils.TrainState,
     batch,
+    rng: jax.Array,
     config: OnlineRLTConfig,
 ) -> tuple[CriticTrainState, dict[str, jax.Array]]:
     model = nnx.merge(policy_state.model_def, policy_state.params)
-    next_action = actor_mean(model, batch.next_state, batch.next_reference_action)
+    next_action = actor_sample(model, batch.next_state, batch.next_reference_action, rng)
     target_q1, target_q2 = critic_model.apply({"params": critic_state.target_params}, batch.next_state, next_action)
     bootstrap_discount = jnp.power(config.discount, batch.bootstrap_steps.astype(jnp.float32))
     target_q = batch.reward + bootstrap_discount * (1.0 - batch.done) * jnp.minimum(target_q1, target_q2)
@@ -130,16 +146,18 @@ def actor_step(
 ) -> tuple[training_utils.TrainState, dict[str, jax.Array]]:
     model = nnx.merge(policy_state.model_def, policy_state.params)
 
-    def loss_fn(model_with_actor, dropout_rng):
+    def loss_fn(model_with_actor, rngs):
+        dropout_rng, sample_rng = rngs
         dropped_reference = _apply_reference_dropout(batch.reference_action, dropout_rng, config.reference_dropout)
-        actions = actor_mean(model_with_actor, batch.state, dropped_reference)
+        actions = actor_sample(model_with_actor, batch.state, dropped_reference, sample_rng)
         q1, q2 = critic_model.apply({"params": critic_state.params}, batch.state, actions)
         q = jnp.minimum(q1, q2)
         bc_penalty = jnp.mean(jnp.square(actions - batch.reference_action), axis=-1)
         return jnp.mean(-q + config.actor_bc_weight * bc_penalty)
 
     diff_state = nnx.DiffState(0, actor_filter())
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, rng)
+    rngs = jax.random.split(rng, 2)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, rngs)
     params = policy_state.params.filter(actor_filter())
     updates, new_opt_state = policy_state.tx.update(grads, policy_state.opt_state, params)
     new_actor_params = optax.apply_updates(params, updates)

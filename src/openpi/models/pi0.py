@@ -71,6 +71,8 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         self.use_rlt = config.use_rlt
         self.rlt_actor_enabled = config.rlt_actor_enabled
+        self.rlt_action_horizon = config.rlt_action_horizon
+        self.rlt_env_action_dim = config.rlt_env_action_dim
         self.rlt_recon_weight = config.rlt_recon_weight
         self.rlt_bc_weight = config.rlt_bc_weight
         paligemma_config = _gemma.get_config(config.paligemma_variant)
@@ -121,13 +123,13 @@ class Pi0(_model.BaseModel):
 
             rlt_actor = nnx_bridge.ToNNX(
                 _rlt_actor_critic.GaussianActor(
-                    action_dim=config.action_dim * config.action_horizon,
+                    action_dim=self.rlt_env_action_dim * self.rlt_action_horizon,
                     hidden_dim=config.rlt_actor_hidden_dim,
                 )
             )
             rlt_actor.lazy_init(
                 jnp.ones((1, config.rlt_token_dim + config.action_dim), dtype=jnp.float32),
-                jnp.ones((1, config.action_dim * config.action_horizon), dtype=jnp.float32),
+                jnp.ones((1, self.rlt_env_action_dim * self.rlt_action_horizon), dtype=jnp.float32),
                 rngs=rngs,
             )
             self.rlt_actor = rlt_actor
@@ -138,22 +140,28 @@ class Pi0(_model.BaseModel):
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"],
+        at.Bool[at.Array, "b s"],
+        at.Bool[at.Array, " s"],
+        at.Bool[at.Array, "b s"],
+    ]:
         input_mask = []
         ar_mask = []
+        rlt_mask = []
         tokens = []
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            image_mask = einops.repeat(
+                obs.image_masks[name],
+                "b -> b s",
+                s=image_tokens.shape[1],
+            )
 
             tokens.append(image_tokens)
-            input_mask.append(
-                einops.repeat(
-                    obs.image_masks[name],
-                    "b -> b s",
-                    s=image_tokens.shape[1],
-                )
-            )
+            input_mask.append(image_mask)
+            rlt_mask.append(image_mask)
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
@@ -162,27 +170,30 @@ class Pi0(_model.BaseModel):
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
+            rlt_mask.append(jnp.zeros_like(obs.tokenized_prompt_mask, dtype=jnp.bool_))
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask
+        rlt_mask = jnp.concatenate(rlt_mask, axis=1)
+        return tokens, input_mask, ar_mask, rlt_mask
 
     def encode_prefix(
         self, obs: _model.Observation
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
+        at.Bool[at.Array, "b s"],
         at.Float[at.Array, "b s emb"],
         _gemma.KVCache,
     ]:
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(obs)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_rlt_mask = self.embed_prefix(obs)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
         assert prefix_out is not None
-        return prefix_tokens, prefix_mask, prefix_out, kv_cache
+        return prefix_tokens, prefix_mask, prefix_rlt_mask, prefix_out, kv_cache
 
     def compute_rl_token(
         self, prefix_out: at.Float[at.Array, "b s emb"], prefix_mask: at.Bool[at.Array, "b s"]
@@ -256,7 +267,7 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_rlt_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
@@ -270,12 +281,12 @@ class Pi0(_model.BaseModel):
         if not self.use_rlt:
             return base_loss
 
-        rl_token, reconstruction = self.compute_rl_token(prefix_out, prefix_mask)
+        rl_token, reconstruction = self.compute_rl_token(jax.lax.stop_gradient(prefix_out), prefix_rlt_mask)
         del rl_token
         recon_loss = _rlt_token_module.masked_reconstruction_loss(
             reconstruction,
             jax.lax.stop_gradient(prefix_out),
-            prefix_mask,
+            prefix_rlt_mask,
         )
         return self.rlt_bc_weight * base_loss + self.rlt_recon_weight * recon_loss[:, None]
 
@@ -288,7 +299,7 @@ class Pi0(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
-        _, prefix_mask, _, kv_cache = self.encode_prefix(observation)
+        _, prefix_mask, _, _, kv_cache = self.encode_prefix(observation)
         return self._sample_reference_actions_from_prefix(
             observation,
             prefix_mask,
@@ -357,7 +368,7 @@ class Pi0(_model.BaseModel):
         if not self.use_rlt:
             raise ValueError("RLT features requested for a model without RL token support.")
         observation = _model.preprocess_observation(None, observation, train=False)
-        _, prefix_mask, prefix_out, kv_cache = self.encode_prefix(observation)
+        _, prefix_mask, prefix_rlt_mask, prefix_out, kv_cache = self.encode_prefix(observation)
         reference_actions = self._sample_reference_actions_from_prefix(
             observation,
             prefix_mask,
@@ -366,7 +377,8 @@ class Pi0(_model.BaseModel):
             num_steps=num_steps,
             noise=noise,
         )
-        rl_token, _ = self.compute_rl_token(prefix_out, prefix_mask)
+        reference_actions = reference_actions[:, : self.rlt_action_horizon, : self.rlt_env_action_dim]
+        rl_token, _ = self.compute_rl_token(prefix_out, prefix_rlt_mask)
         rlt_state = jnp.concatenate([rl_token, observation.state], axis=-1)
         return prefix_out, rl_token, rlt_state, reference_actions
 
@@ -380,7 +392,7 @@ class Pi0(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
-        _, prefix_mask, prefix_out, kv_cache = self.encode_prefix(observation)
+        _, prefix_mask, prefix_rlt_mask, prefix_out, kv_cache = self.encode_prefix(observation)
         reference_actions = self._sample_reference_actions_from_prefix(
             observation,
             prefix_mask,
@@ -392,7 +404,8 @@ class Pi0(_model.BaseModel):
         if not (self.use_rlt and self.rlt_actor_enabled):
             return reference_actions
 
-        rl_token, _ = self.compute_rl_token(prefix_out, prefix_mask)
+        reference_actions = reference_actions[:, : self.rlt_action_horizon, : self.rlt_env_action_dim]
+        rl_token, _ = self.compute_rl_token(prefix_out, prefix_rlt_mask)
         rlt_state = jnp.concatenate([rl_token, observation.state], axis=-1)
         flat_reference_actions = reference_actions.reshape(reference_actions.shape[0], -1)
         refined_actions, _ = self.rlt_actor(rlt_state, flat_reference_actions)

@@ -285,6 +285,7 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
 
     use_delta_joint_actions: bool = True
     default_prompt: str | None = None
+    require_proprio: bool = False
 
     # Refer to AirbotInputs for the augmentation options below.
     prompt_augmentation: bool = False
@@ -306,6 +307,8 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
             "state": "observation.state",
             "actions": "action",
         }
+        if self.require_proprio:
+            repack_dict["proprio"] = "observation.proprio"
         if self.default_prompt is None:
             repack_dict["prompt"] = "prompt"
         if self.pad_action:
@@ -316,6 +319,7 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
                 airbot_policy.AirbotInputs(
                     action_dim=model_config.action_dim,
                     model_type=model_config.model_type,
+                    require_proprio=self.require_proprio,
                     prompt_augmentation=self.prompt_augmentation,
                     halt_injection_prob=self.halt_injection_prob,
                     pad_action=self.pad_action,
@@ -989,29 +993,34 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=10,
+            action_horizon=50,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             use_rlt=True,
             rlt_actor_enabled=False,
+            rlt_action_horizon=10,
+            rlt_env_action_dim=14,
         ),
         data=LeRobotAirbotDataConfig(
             repo_id="your_hf_username/my_airbot_dataset",
             assets=AssetsConfig(asset_id="airbot"),
+            base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=10,
+            action_horizon=50,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             use_rlt=True,
+            rlt_action_horizon=10,
+            rlt_env_action_dim=14,
         ).get_freeze_filter(),
         batch_size=32,
         num_train_steps=20_000,
         ema_decay=None,
-        policy_metadata={"robot": "airbot", "action_dim": 14, "action_horizon": 10},
+        policy_metadata={"robot": "airbot", "action_dim": 14, "action_horizon": 50},
     ),
     TrainConfig(
         # This config defines the deployable PI05-RLT model shape and Airbot transforms.
@@ -1020,24 +1029,30 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=10,
+            action_horizon=50,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             use_rlt=True,
             rlt_actor_enabled=True,
+            rlt_action_horizon=10,
+            rlt_env_action_dim=14,
         ),
         data=LeRobotAirbotDataConfig(
-            repo_id="your_hf_username/my_airbot_dataset",
+            repo_id="not/needed",  # unused by train_rlt_online.py; only asset_id matters
             assets=AssetsConfig(asset_id="airbot"),
+            base_config=DataConfig(prompt_from_task=True),
+            require_proprio=True,
         ),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=10,
+            action_horizon=50,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             use_rlt=True,
             rlt_actor_enabled=True,
+            rlt_action_horizon=10,
+            rlt_env_action_dim=14,
         ).get_freeze_filter(),
         batch_size=32,
         ema_decay=None,

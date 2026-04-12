@@ -76,7 +76,8 @@ def test_pi05_rlt_actor_refinement():
         use_rlt=True,
         rlt_actor_enabled=True,
         action_dim=14,
-        action_horizon=10,
+        action_horizon=50,
+        rlt_action_horizon=10,
         paligemma_variant="dummy",
         action_expert_variant="dummy",
     )
@@ -84,8 +85,33 @@ def test_pi05_rlt_actor_refinement():
 
     batch_size = 2
     obs = config.fake_obs(batch_size)
+    _, _, _, reference_actions = nnx_utils.module_jit(model.extract_rlt_features)(key, obs, num_steps=3)
+    assert reference_actions.shape == (batch_size, config.rlt_action_horizon, config.action_dim)
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=3)
-    assert actions.shape == (batch_size, config.action_horizon, config.action_dim)
+    assert actions.shape == (batch_size, config.rlt_action_horizon, config.action_dim)
+
+
+def test_pi05_rlt_actor_uses_env_action_dim():
+    key = jax.random.key(0)
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        use_rlt=True,
+        rlt_actor_enabled=True,
+        action_dim=32,
+        action_horizon=50,
+        rlt_action_horizon=10,
+        rlt_env_action_dim=14,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(key)
+
+    batch_size = 2
+    obs = config.fake_obs(batch_size)
+    _, _, _, reference_actions = nnx_utils.module_jit(model.extract_rlt_features)(key, obs, num_steps=3)
+    assert reference_actions.shape == (batch_size, config.rlt_action_horizon, config.rlt_env_action_dim)
+    actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=3)
+    assert actions.shape == (batch_size, config.rlt_action_horizon, config.rlt_env_action_dim)
 
 
 def test_rlt_requires_pi05():
