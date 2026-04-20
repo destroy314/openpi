@@ -6,6 +6,7 @@ from scripts import train_rlt_online as online
 from openpi.models import pi0_config
 from openpi.rlt import checkpointing
 from openpi.rlt import replay_buffer
+from openpi.rlt import token_module
 from openpi.rlt import trainer
 
 
@@ -41,6 +42,16 @@ def test_replay_buffer_sample_shapes():
     assert batch.action.shape == (4, 32)
     assert batch.next_reference_action.shape == (4, 32)
     assert batch.bootstrap_steps.shape == (4,)
+
+
+def test_masked_reconstruction_loss_averages_over_embedding_dim():
+    reconstruction = jnp.ones((2, 3, 4), dtype=jnp.float32)
+    target = jnp.zeros((2, 3, 4), dtype=jnp.float32)
+    mask = jnp.array([[True, True, False], [True, False, False]])
+
+    loss = token_module.masked_reconstruction_loss(reconstruction, target, mask)
+
+    np.testing.assert_allclose(loss, np.ones((2,), dtype=np.float32))
 
 
 def test_rlt_training_step_and_checkpoint(tmp_path):

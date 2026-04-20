@@ -252,10 +252,10 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
-    @override
-    def compute_loss(
+    def _compute_all_losses(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> tuple[at.Float[at.Array, "*b ah"], at.Float[at.Array, "*b"] | None]:
+        """Shared forward pass returning (base_loss_per_chunk, recon_loss_per_sample_or_None)."""
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -279,7 +279,7 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
         base_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
         if not self.use_rlt:
-            return base_loss
+            return base_loss, None
 
         rl_token, reconstruction = self.compute_rl_token(jax.lax.stop_gradient(prefix_out), prefix_rlt_mask)
         del rl_token
@@ -288,7 +288,28 @@ class Pi0(_model.BaseModel):
             jax.lax.stop_gradient(prefix_out),
             prefix_rlt_mask,
         )
+        return base_loss, recon_loss
+
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        base_loss, recon_loss = self._compute_all_losses(rng, observation, actions, train=train)
+        if recon_loss is None:
+            return base_loss
         return self.rlt_bc_weight * base_loss + self.rlt_recon_weight * recon_loss[:, None]
+
+    def compute_loss_and_metrics(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Float[at.Array, ""]]]:
+        """Like compute_loss but also returns a dict of scalar metrics for logging."""
+        base_loss, recon_loss = self._compute_all_losses(rng, observation, actions, train=train)
+        metrics = {"action_loss": jnp.mean(base_loss)}
+        if recon_loss is None:
+            return base_loss, metrics
+        metrics["recon_loss"] = jnp.mean(recon_loss)
+        total_loss = self.rlt_bc_weight * base_loss + self.rlt_recon_weight * recon_loss[:, None]
+        return total_loss, metrics
 
     def sample_reference_actions(
         self,

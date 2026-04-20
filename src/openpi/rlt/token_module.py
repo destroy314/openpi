@@ -9,7 +9,7 @@ def masked_reconstruction_loss(
     """Mean squared reconstruction loss over valid prefix tokens."""
     token_mask = mask.astype(target.dtype)[..., None]
     squared_error = jnp.square(reconstruction - target) * token_mask
-    denom = jnp.clip(jnp.sum(token_mask, axis=(1, 2)), 1.0)
+    denom = jnp.clip(jnp.sum(token_mask, axis=(1, 2)) * reconstruction.shape[-1], 1.0)
     return jnp.sum(squared_error, axis=(1, 2)) / denom
 
 
@@ -136,7 +136,8 @@ class RLTokenModule(nn.Module):
         rl_token = nn.Dense(self.token_dim, name="token_proj")(nn.LayerNorm(name="token_ln")(encoder_tokens[:, -1]))
 
         memory = nn.Dense(hidden_dim, name="decoder_memory_proj")(rl_token)[:, None, :]
-        shifted_targets = jnp.concatenate([memory, stopped_prefix[:, :-1]], axis=1)
+        bos = nn.Dense(self.input_dim, name="decoder_bos_proj")(rl_token)[:, None, :]
+        shifted_targets = jnp.concatenate([bos, stopped_prefix[:, :-1]], axis=1)
         decoder_tokens = nn.Dense(hidden_dim, name="decoder_input_proj")(shifted_targets)
         decoder_tokens = decoder_tokens + _sinusoidal_positions(seq_len, hidden_dim, decoder_tokens.dtype)[None, :, :]
         decoder_self_mask = _make_causal_attn_mask(prefix_mask, prefix_mask)

@@ -9,7 +9,6 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-from typing import Protocol
 
 import cv2
 import numpy as np
@@ -36,34 +35,10 @@ except ImportError:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 
-_DEFAULT_LEFT_RESET = (-0.05, -0.26, 0.56, 1.48, -1.19, -1.34, 0.0)
-_DEFAULT_RIGHT_RESET = (-0.05, -0.26, 0.56, -1.48, 1.19, 1.34, 0.0)
-
-
-class ArmController(Protocol):
-    def reset(self) -> None: ...
-
-    def apply_action(self, action: np.ndarray) -> np.ndarray: ...
-
-    def observe(self) -> "ArmObservation": ...
-
-    def close(self) -> None: ...
-
-
-class CameraReader(Protocol):
-    def read(self) -> np.ndarray: ...
-
-    def close(self) -> None: ...
-
-
-class OperatorInterface(Protocol):
-    def prepare_for_episode(self) -> None: ...
-
-    def override_action(self, policy_action: np.ndarray, current_state: np.ndarray) -> tuple[np.ndarray, bool]: ...
-
-    def consume_feedback(self) -> "OperatorFeedback": ...
-
-    def close(self) -> None: ...
+# _DEFAULT_LEFT_RESET = (-0.05, -0.26, 0.56, 1.48, -1.19, -1.34, 0.0)
+# _DEFAULT_RIGHT_RESET = (-0.05, -0.26, 0.56, -1.48, 1.19, 1.34, 0.0)
+_DEFAULT_LEFT_RESET  = (-0.3736, -0.8108,  0.6645,  1.4765, -0.8911, -1.3767,  0.0)
+_DEFAULT_RIGHT_RESET = ( 0.3809, -0.8669,  0.7577, -1.5047,  0.9221,  1.6538,  0.0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,10 +61,6 @@ class ArmConfig:
     follower_port: int
     leader_port: int | None = None
     reset_joint_pos: tuple[float, ...] = _DEFAULT_LEFT_RESET
-    joint_pos_limit_low: tuple[float, ...] | None = None
-    joint_pos_limit_high: tuple[float, ...] | None = None
-    joint_limit_margin: float = 0.2
-    gripper_mode: str = "continuous"
     gripper_max_length: float = 0.07
     gripper_sleep_sec: float = 0.6
     speed_fast: bool = False
@@ -97,18 +68,6 @@ class ArmConfig:
     def __post_init__(self) -> None:
         if len(self.reset_joint_pos) != 7:
             raise ValueError(f"{self.name}: reset_joint_pos must have 7 elements, got {len(self.reset_joint_pos)}")
-        if self.gripper_mode not in {"binary", "continuous"}:
-            raise ValueError(f"{self.name}: unsupported gripper_mode={self.gripper_mode}")
-        low = self.joint_pos_limit_low
-        high = self.joint_pos_limit_high
-        if low is None:
-            low = tuple(float(x) - self.joint_limit_margin for x in self.reset_joint_pos)
-            object.__setattr__(self, "joint_pos_limit_low", low)
-        if high is None:
-            high = tuple(float(x) + self.joint_limit_margin for x in self.reset_joint_pos)
-            object.__setattr__(self, "joint_pos_limit_high", high)
-        if len(self.joint_pos_limit_low) != 7 or len(self.joint_pos_limit_high) != 7:
-            raise ValueError(f"{self.name}: joint_pos_limit_low/high must each have 7 elements")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,7 +82,7 @@ class KeyboardConfig:
 @dataclasses.dataclass(frozen=True)
 class AirbotRLTEnvConfig:
     prompt: str = "do the task"
-    control_hz: int = 50
+    control_hz: int = 25
     max_episode_steps: int = 500
     display_images: bool = True
     fake_env: bool = False
@@ -144,9 +103,9 @@ class AirbotRLTEnvConfig:
     )
     cameras: dict[str, CameraConfig] = dataclasses.field(
         default_factory=lambda: {
-            "cam_high": CameraConfig(index=0, crop_left=80, crop_right=80),
-            "cam_left_wrist": CameraConfig(index=2, crop_left=80, crop_right=80),
-            "cam_right_wrist": CameraConfig(index=4),
+            "cam_high": CameraConfig(index=6),
+            "cam_left_wrist": CameraConfig(index=2),
+            "cam_right_wrist": CameraConfig(index=0),
         }
     )
 
@@ -228,11 +187,6 @@ class OperatorFeedback:
     terminal_reason: str | None = None
 
 
-def create_env(config: AirbotRLTEnvConfig | None = None) -> "AirbotRLTEnv":
-    """Factory for `scripts/train_rlt_online.py --env-factory openpi.rlt.airbot_env:create_env`."""
-    return AirbotRLTEnv(config or AirbotRLTEnvConfig.from_env())
-
-
 class AirbotRLTEnv:
     """Dual-arm Airbot environment for Stage 2 online RLT training.
 
@@ -247,10 +201,10 @@ class AirbotRLTEnv:
         self,
         config: AirbotRLTEnvConfig,
         *,
-        left_arm: ArmController | None = None,
-        right_arm: ArmController | None = None,
-        cameras: Mapping[str, CameraReader] | None = None,
-        operator: OperatorInterface | None = None,
+        left_arm: "_FollowerArm | None" = None,
+        right_arm: "_FollowerArm | None" = None,
+        cameras: "Mapping[str, _AsyncVideoCapture] | None" = None,
+        operator: "KeyboardLeaderOperator | None" = None,
     ) -> None:
         self._config = config
         self._executor = ThreadPoolExecutor(max_workers=2)
@@ -292,6 +246,7 @@ class AirbotRLTEnv:
         step_rewards: list[float] = []
         executed_actions: list[np.ndarray] = []
         intervened_mask: list[bool] = []
+        step_observations: list[dict[str, Any]] = []
         observation = None
         done = False
         last_reason: str | None = None
@@ -301,6 +256,11 @@ class AirbotRLTEnv:
         for action in chunk:
             step_started = time.perf_counter()
             action_to_apply, intervened = self._operator.override_action(action, self._last_state.copy())
+            logging.info(
+                "Executed action: %s, intervened: %s",
+                np.array2string(action_to_apply, precision=2, separator=", "),
+                intervened,
+            )
             left_action, right_action = np.split(np.asarray(action_to_apply, dtype=np.float32), 2)
             left_future = self._executor.submit(self._left_arm.apply_action, left_action)
             right_future = self._executor.submit(self._right_arm.apply_action, right_action)
@@ -317,6 +277,7 @@ class AirbotRLTEnv:
             elapsed = time.perf_counter() - step_started
             time.sleep(max(0.0, (1.0 / float(self._config.control_hz)) - elapsed))
             observation = self._collect_observation()
+            step_observations.append(observation)
             self._episode_steps += 1
 
             feedback = self._operator.consume_feedback()
@@ -336,6 +297,7 @@ class AirbotRLTEnv:
             "step_rewards": step_rewards,
             "executed_actions": np.asarray(executed_actions, dtype=np.float32),
             "intervened_mask": np.asarray(intervened_mask, dtype=bool),
+            "step_observations": step_observations,
             "intervened": float(intervened_any),
             "episode_steps": float(self._episode_steps),
             "executed_steps": float(len(step_rewards)),
@@ -390,7 +352,7 @@ class AirbotRLTEnv:
             "prompt": self._config.prompt,
         }
 
-    def _create_cameras(self) -> dict[str, CameraReader]:
+    def _create_cameras(self) -> "dict[str, _AsyncVideoCapture]":
         return {name: _AsyncVideoCapture(_OpenCVCamera(cfg)) for name, cfg in self._config.cameras.items()}
 
     def _require_open(self) -> None:
@@ -402,7 +364,6 @@ class _FollowerArm:
     def __init__(self, config: ArmConfig, *, fake_env: bool = False) -> None:
         self._config = config
         self._fake = fake_env
-        self._last_gripper_command_at = 0.0
         self._prev_gripper_pos: float | None = None
         self._prev_gripper_observe_at: float | None = None
         if fake_env:
@@ -422,23 +383,15 @@ class _FollowerArm:
             self._robot.switch_mode(RobotMode.SERVO_JOINT_POS)
         else:
             self._robot.move_to_joint_pos(joint_pos=list(self._config.reset_joint_pos[:6]), blocking=True)
-        self._send_gripper_command(float(self._config.reset_joint_pos[6]), mode="continuous")
+        self._robot.servo_eef_pos(float(self._config.reset_joint_pos[6]))
         self._prev_gripper_pos = None
         self._prev_gripper_observe_at = None
 
     def apply_action(self, action: np.ndarray) -> np.ndarray:
         action = np.asarray(action, dtype=np.float32).reshape(7)
-        low = np.asarray(self._config.joint_pos_limit_low, dtype=np.float32)
-        high = np.asarray(self._config.joint_pos_limit_high, dtype=np.float32)
-        clipped = action.copy()
-        clipped[:6] = np.clip(action[:6], low[:6], high[:6])
-        if self._config.gripper_mode == "binary":
-            clipped[6] = float(np.clip(action[6], -1.0, 1.0))
-        else:
-            clipped[6] = float(np.clip(action[6], 0.0, self._config.gripper_max_length))
-        self._send_gripper_command(float(clipped[6]), mode=self._config.gripper_mode)
-        self._robot.servo_joint_pos(clipped[:6].astype(np.float32).tolist())
-        return clipped
+        self._robot.servo_eef_pos(float(action[6]))
+        self._robot.servo_joint_pos(action[:6].tolist())
+        return action
 
     def observe(self) -> ArmObservation:
         joint_pos = _require_array(self._robot.get_joint_pos(), 6, f"{self._config.name}.joint_pos")
@@ -470,24 +423,6 @@ class _FollowerArm:
         if callable(disconnect):
             disconnect()
 
-    def _send_gripper_command(self, value: float, *, mode: str) -> None:
-        current_gripper = _require_array(self._robot.get_eef_pos(), 1, f"{self._config.name}.gripper")[0]
-        if mode == "continuous":
-            target = float(np.clip(value, 0.0, self._config.gripper_max_length))
-            self._robot.servo_eef_pos(target)
-            return
-
-        half_open = self._config.gripper_max_length / 2.0
-        now = time.time()
-        if now - self._last_gripper_command_at < self._config.gripper_sleep_sec:
-            return
-        if value <= -0.5 and current_gripper > half_open:
-            self._robot.servo_eef_pos(0.0)
-            self._last_gripper_command_at = now
-        elif value >= 0.5 and current_gripper < half_open:
-            self._robot.servo_eef_pos(self._config.gripper_max_length)
-            self._last_gripper_command_at = now
-
 
 class KeyboardLeaderOperator:
     def __init__(
@@ -517,8 +452,6 @@ class KeyboardLeaderOperator:
         self._right_leader = None
         self._leader_start = np.zeros((12,), dtype=np.float32)
         self._follower_start = np.zeros((12,), dtype=np.float32)
-        self._left_prev_closed: bool | None = None
-        self._right_prev_closed: bool | None = None
         self._listener = None
 
         if self._enable_intervention:
@@ -541,8 +474,6 @@ class KeyboardLeaderOperator:
             self._pending_reward = 0.0
             self._pending_terminate = False
             self._pending_terminal_reason = None
-            self._left_prev_closed = None
-            self._right_prev_closed = None
 
     def override_action(self, policy_action: np.ndarray, current_state: np.ndarray) -> tuple[np.ndarray, bool]:
         if not self._enable_intervention:
@@ -558,8 +489,6 @@ class KeyboardLeaderOperator:
                         [np.asarray(current_state[:6], dtype=np.float32), np.asarray(current_state[7:13], dtype=np.float32)]
                     )
                     self._follower_start = follower_joint_start.copy()
-                    self._left_prev_closed = None
-                    self._right_prev_closed = None
                     LOGGER.info("Operator intervention enabled")
                 else:
                     LOGGER.info("Operator intervention disabled")
@@ -573,22 +502,8 @@ class KeyboardLeaderOperator:
         right_target = self._follower_start[6:] + right_delta
         left_gripper = self._read_leader_gripper(self._left_leader)
         right_gripper = self._read_leader_gripper(self._right_leader)
-        if self._left_arm.gripper_mode == "binary":
-            left_gripper, self._left_prev_closed = _edge_triggered_binary_gripper_command(
-                left_gripper,
-                self._left_prev_closed,
-                threshold=self._left_arm.gripper_max_length / 2.0,
-            )
-        else:
-            left_gripper = float(np.clip(left_gripper, 0.0, self._left_arm.gripper_max_length))
-        if self._right_arm.gripper_mode == "binary":
-            right_gripper, self._right_prev_closed = _edge_triggered_binary_gripper_command(
-                right_gripper,
-                self._right_prev_closed,
-                threshold=self._right_arm.gripper_max_length / 2.0,
-            )
-        else:
-            right_gripper = float(np.clip(right_gripper, 0.0, self._right_arm.gripper_max_length))
+        left_gripper = float(left_gripper)
+        right_gripper = float(right_gripper)
         expert = np.concatenate(
             [left_target, np.asarray([left_gripper], dtype=np.float32), right_target, np.asarray([right_gripper], dtype=np.float32)]
         ).astype(np.float32)
@@ -624,6 +539,7 @@ class KeyboardLeaderOperator:
             return
         if not self._allow_key(key_name):
             return
+        LOGGER.info("Keyboard key pressed: %s", key_name)
         with self._lock:
             if key_name == self._keyboard_config.intervention_toggle_key:
                 self._toggle_requested = True
@@ -852,7 +768,7 @@ def _require_array(value: Any, expected_dim: int, name: str) -> np.ndarray:
     return array
 
 
-def _read_camera(camera: CameraReader) -> np.ndarray:
+def _read_camera(camera: "_AsyncVideoCapture") -> np.ndarray:
     frame = np.asarray(camera.read())
     if frame.ndim != 3 or frame.shape[2] != 3:
         raise RuntimeError(f"Camera must return HWC uint8 images, got shape {frame.shape}")
@@ -876,22 +792,6 @@ def _make_fake_camera_frame(config: CameraConfig) -> np.ndarray:
     label = f"FAKECAM {config.index if config.index is not None else 'N/A'}"
     cv2.putText(frame, label, (24, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
     return frame
-
-
-def _edge_triggered_binary_gripper_command(
-    raw_position: float,
-    previous_closed: bool | None,
-    *,
-    threshold: float,
-) -> tuple[float, bool]:
-    closed = raw_position < threshold
-    if previous_closed is None:
-        return 0.0, closed
-    if closed and not previous_closed:
-        return -1.0, closed
-    if not closed and previous_closed:
-        return 1.0, closed
-    return 0.0, closed
 
 
 def _safe_close(resource: Any) -> None:

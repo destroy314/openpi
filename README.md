@@ -30,8 +30,6 @@
 repo_id="your_hf_username/my_airbot_dataset"
 ```
 
-`pi05_airbot_rlt`（Stage 2）的 `repo_id` 已设为 `"not/needed"`，不需要修改——Stage 2 使用在线 rollout 数据，从不读取数据集。
-
 除此之外，下面这些项也需要人工确认或填写：
 
 - `OPENPI_AIRBOT_RLT_CONFIG` 是可选的；默认值已对齐 TOK2 标准硬件（端口、相机 index、`max_episode_steps=500`）。只有在硬件端口或相机编号不是默认值、或需要修改 `prompt` 时，才需要准备这个文件（见第 6.1 节）
@@ -84,6 +82,23 @@ examples/airbot/tok2_stage1_collection.yaml
 - `run.single_task` 直接决定 episode task 文本；同一任务不要混用多套完全不同的表述
 - 采集阶段就固定三路相机命名
 - 如果后续 Stage 2 运行时用的是双臂任务，Stage 1 不要只采单臂演示，否则 reference chunk 的分布会和在线 refinement 明显错位
+
+### 3.2 从 MCAP 文件转换（可选路径）
+
+如果采集工具直接输出的是 MCAP 格式（即每个 episode 对应一个 `.mcap` 文件），可以用本仓库提供的转换脚本生成 LeRobot 数据集：
+
+```bash
+uv run examples/airbot/convert_mcap_to_lerobot.py \
+    --mcap-dir /path/to/mcap_dir \
+    --repo-id <org>/<dataset-name>
+```
+
+脚本默认适配 PTK 双臂机器人，话题配置如下：
+
+- **state**：`/left/follow/arm/joint_state/position`（6）+ `/left/follow/eef/joint_state/position`（1）+ 右臂同理，共 14 维
+- **action**：`/left/lead/arm/joint_state/position` + eef + 右臂，共 14 维
+- **camera**：MCAP 附件 `/env_camera/color/image_raw` → `cam_high`，`/left_camera/color/image_raw` → `cam_left_wrist`，`/right_camera/color/image_raw` → `cam_right_wrist`
+- task 文本自动从 MCAP metadata 的 `task_info.task_description` 字段读取
 
 ## 4. Airbot 数据格式要求
 
@@ -149,13 +164,13 @@ Stage 1 使用标准训练入口 `scripts/train.py`，训练配置名为 `pi05_a
 ### 5.1 先计算 norm stats
 
 ```bash
-uv run scripts/compute_norm_stats.py pi05_airbot_rlt_token
+uv run scripts/compute_norm_stats.py --config-name pi05_airbot_rlt_token
 ```
 
 如果数据量很大，也可以先做一次抽样统计：
 
 ```bash
-uv run scripts/compute_norm_stats.py pi05_airbot_rlt_token --max-frames 100000
+uv run scripts/compute_norm_stats.py --config-name pi05_airbot_rlt_token --max-frames 100000
 ```
 
 ### 5.2 启动训练
@@ -309,9 +324,8 @@ openpi.rlt.airbot_env:create_env
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 uv run scripts/train_rlt_online.py \
   --config pi05_airbot_rlt \
-  --init-checkpoint-dir checkpoints/pi05_airbot_rlt_token/stage1_airbot_rlt/19999 \
+  --init-checkpoint-dir checkpoints/pi05_airbot_rlt_token/stage1_airbot_rlt/9999 \
   --checkpoint-dir checkpoints/pi05_airbot_rlt/online_stage2 \
-  --env-factory openpi.rlt.airbot_env:create_env \
   --max-env-steps 50000 \
   --warmup-steps 1000 \
   --chunk-stride 2 \
@@ -340,7 +354,6 @@ uv run scripts/train_rlt_online.py \
   --config pi05_airbot_rlt \
   --init-checkpoint-dir checkpoints/pi05_airbot_rlt_token/stage1_airbot_rlt/19999 \
   --checkpoint-dir checkpoints/pi05_airbot_rlt/online_stage2 \
-  --env-factory openpi.rlt.airbot_env:create_env \
   --resume
 ```
 
@@ -373,6 +386,50 @@ uv run examples/simple_client/main.py --env AIRBOT --host 127.0.0.1 --port 8000
 - server 能正常起
 - Airbot observation schema 能被服务端接受
 - 服务端能返回 `(10, 14)` 的 action chunk
+
+### 7.3 用 Airbot rollout client 做真机纯 VLA 验证
+
+如果已经接好 Airbot 双臂和三路相机，可以直接运行：
+
+```bash
+python -m examples.airbot.vla_rollout_client \
+    --host 192.168.1.10 \
+    --port 8000 \
+    --prompt "pick up the cup"
+```
+
+常用补充参数：
+
+- `--config-path /path/to/airbot_eval.toml`：从 `.toml` / `.json` 读取端口、相机、prompt 等环境配置
+- `--action-horizon 25`：每次查询 policy server 后连续执行的动作步数
+- `--control-hz 25`：低层控制频率
+- `--normalize-gripper True`：Stage 1 数据若使用归一化夹爪（常见于 imitate-all / MCAP 转 LeRobot），保持 `True`
+
+如果不使用配置文件，也可以直接通过命令行覆盖相机和端口，例如：
+
+```bash
+python -m examples.airbot.vla_rollout_client \
+    --host 192.168.1.10 \
+    --port 8000 \
+    --prompt "pick up the cup" \
+    --cam-high 6 \
+    --cam-left-wrist 2 \
+    --cam-right-wrist 0 \
+    --left-follower-port 50051 \
+    --right-follower-port 50053
+```
+
+运行时键位：
+
+- `p`：暂停 / 继续
+- `r`：结束当前 episode 并重置机械臂
+- `q`：当前 episode 结束后退出
+
+进入 Stage 2 前，建议至少确认：
+
+- rollout 动作连续，没有明显抖动、卡死或发散
+- `prompt`、状态维度和三路相机没有串 schema
+- gripper 数值范围与训练数据一致；不确定时优先检查 `observation.state` 的第 `7`、`14` 维是否接近 `[0, 1]` 还是 `[0, 0.07]`
 
 ## 8. 建议的实验顺序
 

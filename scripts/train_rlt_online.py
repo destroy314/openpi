@@ -1,8 +1,7 @@
 import dataclasses
-import importlib
 import logging
 import pathlib
-from typing import Any, Protocol
+from typing import Any
 
 import flax.nnx as nnx
 import jax
@@ -10,27 +9,15 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 
+from openpi import transforms as _transforms
 from openpi.policies import policy_config as _policy_config
+from openpi.rlt import airbot_env as _airbot_env
 from openpi.rlt import checkpointing as _checkpointing
 from openpi.rlt import replay_buffer as _replay_buffer
 from openpi.rlt import trainer as _trainer
 from openpi.shared import nnx_utils
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
-
-
-class RLTEnvironment(Protocol):
-    """External online-RL environment.
-
-    When `chunk_stride > 1`, `step()` is expected to include per-step rewards in
-    `info["step_rewards"]` so the trainer can build chunk-aligned multi-step returns.
-    """
-
-    def reset(self) -> dict[str, Any] | tuple[dict[str, Any], Any]: ...
-
-    def step(self, action_chunk: np.ndarray) -> tuple[Any, ...]: ...
-
-    def close(self) -> None: ...
 
 
 @dataclasses.dataclass
@@ -49,8 +36,6 @@ class Args:
     init_checkpoint_dir: pathlib.Path = pathlib.Path("checkpoints/pi05_airbot_rlt_token/default/19999")
     # Output directory for Stage 2 checkpoints.
     checkpoint_dir: pathlib.Path = pathlib.Path("checkpoints/pi05_airbot_rlt/online")
-    # Import path for an environment factory, e.g. "my_pkg.my_env:create_env".
-    env_factory: str = "your_pkg.your_env:create_env"
 
     max_env_steps: int = 10_000
     warmup_steps: int = 1_000
@@ -68,34 +53,6 @@ class Args:
     seed: int = 0
 
     online: _trainer.OnlineRLTConfig = dataclasses.field(default_factory=_trainer.OnlineRLTConfig)
-
-
-def _load_env_factory(factory_path: str):
-    module_name, sep, attr_name = factory_path.partition(":")
-    if not sep:
-        raise ValueError(f"env_factory must be of the form 'module:callable', got {factory_path}")
-    factory = getattr(importlib.import_module(module_name), attr_name)
-    if not callable(factory):
-        raise TypeError(f"env_factory target must be callable, got {type(factory)}")
-    return factory
-
-
-def _reset_env(env: RLTEnvironment) -> dict[str, Any]:
-    result = env.reset()
-    if isinstance(result, tuple):
-        return result[0]
-    return result
-
-
-def _step_env(env: RLTEnvironment, action_chunk: np.ndarray) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
-    result = env.step(action_chunk)
-    if len(result) == 4:
-        observation, reward, done, info = result
-        return observation, float(reward), bool(done), info
-    if len(result) == 5:
-        observation, reward, terminated, truncated, info = result
-        return observation, float(reward), bool(terminated or truncated), info
-    raise ValueError("env.step() must return either (obs, reward, done, info) or gym-style 5-tuples.")
 
 
 def _to_jax_batch(batch: _replay_buffer.TransitionBatch) -> _replay_buffer.TransitionBatch:
@@ -124,6 +81,37 @@ def _compute_features(
     state = np.asarray(rlt_state[0], dtype=np.float32)
     reference = np.asarray(reference_actions[0].reshape(-1), dtype=np.float32)
     return state, reference
+
+
+def _slice_norm_stats(stats, dim: int):
+    """Truncate a NormStats to the first `dim` elements along the last axis."""
+    from openpi.shared.normalize import NormStats
+    return NormStats(
+        mean=stats.mean[..., :dim],
+        std=stats.std[..., :dim],
+        q01=stats.q01[..., :dim] if stats.q01 is not None else None,
+        q99=stats.q99[..., :dim] if stats.q99 is not None else None,
+    )
+
+
+def _denormalize_action(norm_stats, use_quantiles: bool, actions: np.ndarray) -> np.ndarray:
+    """Convert a (steps, env_action_dim) action from normalized model space to real joint-position space."""
+    if norm_stats is None or "actions" not in norm_stats:
+        return actions
+    env_dim = actions.shape[-1]
+    action_stats = {"actions": _slice_norm_stats(norm_stats["actions"], env_dim)}
+    outputs = _transforms.Unnormalize(action_stats, use_quantiles=use_quantiles)({"actions": actions})
+    return np.asarray(outputs["actions"], dtype=np.float32)
+
+
+def _normalize_action(norm_stats, use_quantiles: bool, actions: np.ndarray) -> np.ndarray:
+    """Convert a (steps, env_action_dim) action from real joint-position space back to normalized model space."""
+    if norm_stats is None or "actions" not in norm_stats:
+        return actions
+    env_dim = actions.shape[-1]
+    action_stats = {"actions": _slice_norm_stats(norm_stats["actions"], env_dim)}
+    normalized = _transforms.Normalize(action_stats, use_quantiles=use_quantiles)({"actions": actions})
+    return np.asarray(normalized["actions"], dtype=np.float32)
 
 
 def _actor_action(policy_state, rng: jax.Array, state: np.ndarray, reference_action: np.ndarray) -> np.ndarray:
@@ -219,31 +207,63 @@ def _discounted_return(reward_history: list[float], start_step: int, horizon: in
     return float(sum((discount**offset) * reward_history[start_step + offset] for offset in range(horizon)))
 
 
+def _record_action_history(
+    action_history: dict[int, np.ndarray],
+    intervention_history: dict[int, bool],
+    *,
+    start_step: int,
+    executed_actions: np.ndarray,
+    intervened_mask: np.ndarray,
+) -> None:
+    if executed_actions.ndim != 2:
+        raise ValueError(f"executed_actions must be rank-2, got shape {executed_actions.shape}")
+    if intervened_mask.shape != (executed_actions.shape[0],):
+        raise ValueError(
+            f"intervened_mask must have shape ({executed_actions.shape[0]},), got {intervened_mask.shape}"
+        )
+    for offset, action in enumerate(executed_actions):
+        action_history[start_step + offset] = np.asarray(action, dtype=np.float32).copy()
+        intervention_history[start_step + offset] = bool(intervened_mask[offset])
+
+
 def _flush_ready_chunks(
-    pending_chunks: list[PlannedChunk],
+    pending_chunks: list[int],
     feature_history: dict[int, tuple[np.ndarray, np.ndarray]],
+    action_history: dict[int, np.ndarray],
+    intervention_history: dict[int, bool],
     reward_history: list[float],
     replay: _replay_buffer.ReplayBuffer,
     *,
     current_step: int,
     action_horizon: int,
+    env_action_dim: int,
     discount: float,
     terminal: bool = False,
     terminal_features: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> int:
     emitted = 0
     while pending_chunks:
-        chunk = pending_chunks[0]
-        available_steps = current_step - chunk.step
+        chunk_step = pending_chunks[0]
+        available_steps = current_step - chunk_step
         if available_steps <= 0:
             break
         if available_steps < action_horizon and not terminal:
             break
 
         bootstrap_steps = min(action_horizon, available_steps)
-        discounted_reward = _discounted_return(reward_history, chunk.step, bootstrap_steps, discount)
+        discounted_reward = _discounted_return(reward_history, chunk_step, bootstrap_steps, discount)
+        state, reference_action = feature_history[chunk_step]
+        reference_chunk = np.asarray(reference_action, dtype=np.float32).reshape(action_horizon, env_action_dim).copy()
+        action_chunk = reference_chunk.copy()
+        for offset in range(bootstrap_steps):
+            step = chunk_step + offset
+            executed_action = action_history[step]
+            action_chunk[offset] = executed_action
+            if intervention_history.get(step, False):
+                reference_chunk[offset] = executed_action
+
         if bootstrap_steps == action_horizon and not terminal:
-            next_state, next_reference_action = feature_history[chunk.step + action_horizon]
+            next_state, next_reference_action = feature_history[chunk_step + action_horizon]
             done = False
         else:
             if terminal_features is None:
@@ -252,9 +272,9 @@ def _flush_ready_chunks(
             done = True
 
         replay.add(
-            state=chunk.state,
-            action=chunk.action,
-            reference_action=chunk.reference_action,
+            state=state,
+            action=action_chunk.reshape(-1),
+            reference_action=reference_chunk.reshape(-1),
             reward=discounted_reward,
             next_state=next_state,
             next_reference_action=next_reference_action,
@@ -294,12 +314,11 @@ def main(args: Args) -> None:
         else None
     )
 
-    env_factory = _load_env_factory(args.env_factory)
-    env = env_factory()
+    env = _airbot_env.AirbotRLTEnv(_airbot_env.AirbotRLTEnvConfig.from_env())
 
     rng = jax.random.key(args.seed)
     rng, feature_rng = jax.random.split(rng)
-    initial_observation = _reset_env(env)
+    initial_observation = env.reset()
     initial_state, initial_reference = _compute_features(
         policy,
         extract_features,
@@ -343,86 +362,123 @@ def main(args: Args) -> None:
     metrics: list[dict[str, float]] = []
     reward_history: list[float] = [0.0] * start_step
     feature_history: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-    pending_chunks: list[PlannedChunk] = []
+    action_history: dict[int, np.ndarray] = {}
+    intervention_history: dict[int, bool] = {}
+    pending_chunks: list[int] = []
     current_step = start_step
 
     try:
         while current_step < args.max_env_steps:
-            rng, feature_rng = jax.random.split(rng)
-            state, reference_action = _compute_features(
-                policy,
-                extract_features,
-                feature_rng,
-                observation,
-                diffusion_steps=args.diffusion_steps,
-            )
-            feature_history[current_step] = (state, reference_action)
-            _flush_ready_chunks(
-                pending_chunks,
-                feature_history,
-                reward_history,
-                replay,
-                current_step=current_step,
-                action_horizon=online_action_horizon,
-                discount=args.online.discount,
-            )
+            if current_step in feature_history:
+                state, reference_action = feature_history[current_step]
+            else:
+                rng, feature_rng = jax.random.split(rng)
+                state, reference_action = _compute_features(
+                    policy,
+                    extract_features,
+                    feature_rng,
+                    observation,
+                    diffusion_steps=args.diffusion_steps,
+                )
+                feature_history[current_step] = (state, reference_action)
+                pending_chunks.append(current_step)
 
             if current_step < args.warmup_steps:
                 action = reference_action
             else:
                 rng, actor_sample_rng = jax.random.split(rng)
                 action = _actor_action(policy_state, actor_sample_rng, state, reference_action)
-            pending_chunks.append(
-                PlannedChunk(
-                    step=current_step,
-                    state=state,
-                    action=action,
-                    reference_action=reference_action,
-                )
-            )
 
-            executed_chunk = action.reshape(online_action_horizon, online_env_action_dim)[: args.chunk_stride]
-            next_observation, reward, done, info = _step_env(env, executed_chunk)
-            step_rewards = _extract_step_rewards(reward, info, args.chunk_stride)
-            executed_actions = _extract_executed_actions(
+            # action / reference_action are in normalized model space; denormalize at env boundary.
+            executed_chunk_norm = action.reshape(online_action_horizon, online_env_action_dim)
+            executed_chunk_real = _denormalize_action(norm_stats, data_config.use_quantile_norm, executed_chunk_norm)
+            next_observation, reward, done, info = env.step(executed_chunk_real)
+            step_rewards = _extract_step_rewards(reward, info, online_action_horizon)
+            # executed_actions returned by env are in real joint-position space; normalize back before
+            # storing in replay so that replay actions stay in the same space as reference_action.
+            executed_actions_real = _extract_executed_actions(
                 info,
                 executed_steps=len(step_rewards),
-                fallback_actions=executed_chunk,
+                fallback_actions=executed_chunk_real,
             )
             intervened_mask = _extract_intervened_mask(info, executed_steps=len(step_rewards))
-            _patch_chunk_with_executed_prefix(
-                pending_chunks[-1],
-                executed_actions=executed_actions,
+            executed_actions_norm = _normalize_action(
+                norm_stats, data_config.use_quantile_norm, executed_actions_real
+            )
+            _record_action_history(
+                action_history,
+                intervention_history,
+                start_step=current_step,
+                executed_actions=executed_actions_norm,
                 intervened_mask=intervened_mask,
-                action_horizon=online_action_horizon,
-                action_dim=online_env_action_dim,
-                env_action_dim=executed_chunk.shape[-1],
             )
             reward_history.extend(step_rewards)
+
+            step_observations = info.get("step_observations")
+            if step_observations is not None:
+                if not isinstance(step_observations, list):
+                    raise ValueError("info['step_observations'] must be a list when provided.")
+                if len(step_observations) != len(step_rewards):
+                    raise ValueError(
+                        "info['step_observations'] length "
+                        f"({len(step_observations)}) must match executed_steps ({len(step_rewards)})"
+                    )
+
+            sampled_offsets = list(range(args.chunk_stride, len(step_rewards) + 1, args.chunk_stride))
+            for offset in sampled_offsets:
+                sample_step = current_step + offset
+                if sample_step in feature_history:
+                    continue
+                if offset == len(step_rewards):
+                    sample_observation = next_observation
+                else:
+                    if step_observations is None:
+                        raise ValueError(
+                            "env.step() must provide info['step_observations'] when chunk_stride < action_horizon "
+                            "so the trainer can subsample replay entries from intermediate states."
+                        )
+                    sample_observation = step_observations[offset - 1]
+                rng, feature_rng = jax.random.split(rng)
+                feature_history[sample_step] = _compute_features(
+                    policy,
+                    extract_features,
+                    feature_rng,
+                    sample_observation,
+                    diffusion_steps=args.diffusion_steps,
+                )
+                pending_chunks.append(sample_step)
+
             current_step += len(step_rewards)
 
             terminal_features: tuple[np.ndarray, np.ndarray] | None = None
             if done:
-                rng, terminal_rng = jax.random.split(rng)
-                terminal_features = _compute_features(
-                    policy,
-                    extract_features,
-                    terminal_rng,
-                    next_observation,
-                    diffusion_steps=args.diffusion_steps,
-                )
-                feature_history[current_step] = terminal_features
-                _flush_ready_chunks(
-                    pending_chunks,
-                    feature_history,
-                    reward_history,
-                    replay,
-                    current_step=current_step,
-                    action_horizon=online_action_horizon,
-                    discount=args.online.discount,
-                    terminal=True,
-                    terminal_features=terminal_features,
-                )
+                if current_step in feature_history:
+                    terminal_features = feature_history[current_step]
+                else:
+                    rng, terminal_rng = jax.random.split(rng)
+                    terminal_features = _compute_features(
+                        policy,
+                        extract_features,
+                        terminal_rng,
+                        next_observation,
+                        diffusion_steps=args.diffusion_steps,
+                    )
+                    feature_history[current_step] = terminal_features
+
+            _flush_ready_chunks(
+                pending_chunks,
+                feature_history,
+                action_history,
+                intervention_history,
+                reward_history,
+                replay,
+                current_step=current_step,
+                action_horizon=online_action_horizon,
+                env_action_dim=online_env_action_dim,
+                discount=args.online.discount,
+                terminal=done,
+                terminal_features=terminal_features,
+            )
 
             if len(replay) >= args.batch_size and current_step >= args.warmup_steps:
                 for _ in range(args.utd_ratio):
@@ -457,7 +513,7 @@ def main(args: Args) -> None:
                 }
             )
             for key, value in info.items():
-                if key != "step_rewards" and np.isscalar(value):
+                if key != "step_rewards" and np.isscalar(value) and not isinstance(value, str):
                     metrics.append({f"env/{key}": float(value)})
 
             if current_step % args.log_interval == 0 and metrics:
@@ -472,7 +528,6 @@ def main(args: Args) -> None:
                 _checkpointing.save_checkpoint(
                     checkpoint_root,
                     current_step,
-                    params=policy_state.params.to_pure_dict(),
                     policy_state=_trainer.bundle_policy_state(policy_state),
                     critic_state=_trainer.bundle_critic_state(critic_state),
                     norm_stats=norm_stats,
@@ -480,7 +535,9 @@ def main(args: Args) -> None:
                 )
 
             if done:
-                observation = _reset_env(env)
+                observation = env.reset()
+                action_history.clear()
+                intervention_history.clear()
                 feature_history.clear()
             else:
                 observation = next_observation
@@ -498,19 +555,25 @@ def main(args: Args) -> None:
             _flush_ready_chunks(
                 pending_chunks,
                 feature_history,
+                action_history,
+                intervention_history,
                 reward_history,
                 replay,
                 current_step=current_step,
                 action_horizon=online_action_horizon,
+                env_action_dim=online_env_action_dim,
                 discount=args.online.discount,
             )
             _flush_ready_chunks(
                 pending_chunks,
                 feature_history,
+                action_history,
+                intervention_history,
                 reward_history,
                 replay,
                 current_step=current_step,
                 action_horizon=online_action_horizon,
+                env_action_dim=online_env_action_dim,
                 discount=args.online.discount,
                 terminal=True,
                 terminal_features=final_features,
@@ -519,16 +582,13 @@ def main(args: Args) -> None:
         _checkpointing.save_checkpoint(
             checkpoint_root,
             max(current_step - 1, 0),
-            params=policy_state.params.to_pure_dict(),
             policy_state=_trainer.bundle_policy_state(policy_state),
             critic_state=_trainer.bundle_critic_state(critic_state),
             norm_stats=norm_stats,
             asset_id=data_config.asset_id,
         )
     finally:
-        close_fn = getattr(env, "close", None)
-        if callable(close_fn):
-            close_fn()
+        env.close()
 
 
 if __name__ == "__main__":

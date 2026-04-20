@@ -48,7 +48,7 @@ class _FakeArm:
 
 class _FakeCamera:
     def __init__(self, value: int) -> None:
-        self._frame = np.full((32, 48, 3), value, dtype=np.uint8)
+        self._frame = np.full((480, 640, 3), value, dtype=np.uint8)
 
     def read(self) -> np.ndarray:
         return self._frame.copy()

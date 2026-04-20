@@ -74,7 +74,9 @@ class Policy(BasePolicy):
         if self._is_pytorch_model:
             raise NotImplementedError("prepare_observation is only supported for JAX policies.")
         inputs = self.prepare_inputs(obs)
-        batched_inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        batched_inputs = jax.tree.map(
+            lambda x: x if isinstance(x, str) else jnp.asarray(x)[np.newaxis, ...], inputs
+        )
         return inputs, _model.Observation.from_dict(batched_inputs)
 
     @override
@@ -82,7 +84,9 @@ class Policy(BasePolicy):
         inputs = self.prepare_inputs(obs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
-            inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+            inputs = jax.tree.map(
+                lambda x: x if isinstance(x, str) else jnp.asarray(x)[np.newaxis, ...], inputs
+            )
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device

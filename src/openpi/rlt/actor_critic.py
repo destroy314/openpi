@@ -7,6 +7,7 @@ class MLP(nn.Module):
     output_dim: int
     hidden_dim: int = 256
     num_layers: int = 2
+    zero_output_init: bool = False
 
     @nn.compact
     def __call__(self, inputs: jax.Array) -> jax.Array:
@@ -14,6 +15,12 @@ class MLP(nn.Module):
         for _ in range(self.num_layers):
             x = nn.Dense(self.hidden_dim)(x)
             x = nn.gelu(x)
+        if self.zero_output_init:
+            return nn.Dense(
+                self.output_dim,
+                kernel_init=nn.initializers.normal(0.01),
+                bias_init=nn.initializers.zeros,
+            )(x)
         return nn.Dense(self.output_dim)(x)
 
 
@@ -28,7 +35,7 @@ class GaussianActor(nn.Module):
     @nn.compact
     def __call__(self, state: jax.Array, reference_action: jax.Array) -> tuple[jax.Array, jax.Array]:
         features = jnp.concatenate([state, reference_action], axis=-1)
-        delta = MLP(self.action_dim, hidden_dim=self.hidden_dim, num_layers=self.num_layers)(features)
+        delta = MLP(self.action_dim, hidden_dim=self.hidden_dim, num_layers=self.num_layers, zero_output_init=True)(features)
         mean = reference_action + delta
         std = jnp.full(mean.shape, self.init_std, dtype=mean.dtype)
         return mean, std

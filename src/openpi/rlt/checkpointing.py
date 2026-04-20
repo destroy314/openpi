@@ -46,16 +46,19 @@ def save_checkpoint(
     checkpoint_dir: pathlib.Path | str,
     step: int,
     *,
-    params: dict[str, Any],
     policy_state: dict[str, Any],
     critic_state: dict[str, Any],
     norm_stats: dict[str, _normalize.NormStats] | None,
     asset_id: str | None,
 ) -> pathlib.Path:
+    """Save Stage-2 RLT checkpoint.
+
+    Only the RL model (actor optimizer state + critic) is persisted.
+    The VLA backbone is frozen and always reloaded from the Stage-1 checkpoint,
+    so there is no need to duplicate those weights here.
+    """
     step_dir = pathlib.Path(checkpoint_dir) / str(step)
     step_dir.mkdir(parents=True, exist_ok=True)
-    with ocp.PyTreeCheckpointer() as checkpointer:
-        checkpointer.save(step_dir / "params", {"params": params})
     with ocp.PyTreeCheckpointer() as checkpointer:
         checkpointer.save(step_dir / "policy_state", policy_state)
     with ocp.PyTreeCheckpointer() as checkpointer:

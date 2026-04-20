@@ -283,7 +283,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 class LeRobotAirbotDataConfig(DataConfigFactory):
     """Airbot data config that reuses only the hardware-facing schema and transforms."""
 
-    use_delta_joint_actions: bool = True
+    use_delta_joint_actions: bool = False
     default_prompt: str | None = None
     require_proprio: bool = False
 
@@ -998,13 +998,15 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
             use_rlt=True,
             rlt_actor_enabled=False,
+            rlt_recon_weight=0.02,
             rlt_action_horizon=10,
             rlt_env_action_dim=14,
         ),
         data=LeRobotAirbotDataConfig(
-            repo_id="your_hf_username/my_airbot_dataset",
+            repo_id="icrlab/block_handover",
             assets=AssetsConfig(asset_id="airbot"),
             base_config=DataConfig(prompt_from_task=True),
+            crop_img_square=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         freeze_filter=pi0_config.Pi0Config(
@@ -1018,7 +1020,7 @@ _CONFIGS = [
             rlt_env_action_dim=14,
         ).get_freeze_filter(),
         batch_size=32,
-        num_train_steps=20_000,
+        num_train_steps=10_000,
         ema_decay=None,
         policy_metadata={"robot": "airbot", "action_dim": 14, "action_horizon": 50},
     ),
@@ -1041,6 +1043,7 @@ _CONFIGS = [
             repo_id="not/needed",  # unused by train_rlt_online.py; only asset_id matters
             assets=AssetsConfig(asset_id="airbot"),
             base_config=DataConfig(prompt_from_task=True),
+            crop_img_square=True,
             require_proprio=True,
         ),
         freeze_filter=pi0_config.Pi0Config(

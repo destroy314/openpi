@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 from typing import Any
 
 import flax.nnx as nnx
@@ -6,6 +7,7 @@ import flax.traverse_util
 import jax
 import jax.numpy as jnp
 import optax
+import numpy as np
 
 from openpi.rlt import actor_critic as _actor_critic
 from openpi.shared import nnx_utils
@@ -92,6 +94,23 @@ def actor_sample(
     deterministic: bool = False,
 ) -> jax.Array:
     mean, std = model.rlt_actor(state, reference_action)
+    delta = mean - reference_action
+    jax.debug.print(
+        "actor_sample | state     : mean={m:.4f} std={s:.4f} max_abs={mx:.4f}",
+        m=jnp.mean(state), s=jnp.std(state), mx=jnp.max(jnp.abs(state)),
+    )
+    jax.debug.print(
+        "actor_sample | ref_action: mean={m:.4f} std={s:.4f} max_abs={mx:.4f}",
+        m=jnp.mean(reference_action), s=jnp.std(reference_action), mx=jnp.max(jnp.abs(reference_action)),
+    )
+    jax.debug.print(
+        "actor_sample | delta     : mean={m:.4f} std={s:.4f} max_abs={mx:.4f}",
+        m=jnp.mean(delta), s=jnp.std(delta), mx=jnp.max(jnp.abs(delta)),
+    )
+    jax.debug.print(
+        "actor_sample | mean_out  : mean={m:.4f} std={s:.4f} max_abs={mx:.4f}",
+        m=jnp.mean(mean), s=jnp.std(mean), mx=jnp.max(jnp.abs(mean)),
+    )
     if deterministic:
         return mean
     noise = jax.random.normal(rng, mean.shape, dtype=mean.dtype)
@@ -118,6 +137,19 @@ def critic_step(
         return loss, (q1, q2)
 
     (loss, (q1, q2)), grads = jax.value_and_grad(loss_fn, has_aux=True)(critic_state.params)
+    grad_norm = optax.global_norm(grads)
+    logging.info(
+        "critic_step | target_q: mean=%.4f std=%.4f max_abs=%.4f",
+        float(jnp.mean(target_q)), float(jnp.std(target_q)), float(jnp.max(jnp.abs(target_q))),
+    )
+    logging.info(
+        "critic_step | q1      : mean=%.4f std=%.4f max_abs=%.4f",
+        float(jnp.mean(q1)), float(jnp.std(q1)), float(jnp.max(jnp.abs(q1))),
+    )
+    logging.info(
+        "critic_step | loss=%.4f grad_norm=%.4f",
+        float(loss), float(grad_norm),
+    )
     updates, new_opt_state = critic_state.tx.update(grads, critic_state.opt_state, critic_state.params)
     new_params = optax.apply_updates(critic_state.params, updates)
     new_target_params = optax.incremental_update(new_params, critic_state.target_params, config.target_tau)
@@ -158,6 +190,12 @@ def actor_step(
     diff_state = nnx.DiffState(0, actor_filter())
     rngs = jax.random.split(rng, 2)
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, rngs)
+    actor_grads = grads.filter(actor_filter())
+    grad_norm = optax.global_norm(actor_grads.to_pure_dict())
+    logging.info(
+        "actor_step | actor_loss=%.4f grad_norm=%.4f",
+        float(loss), float(grad_norm),
+    )
     params = policy_state.params.filter(actor_filter())
     updates, new_opt_state = policy_state.tx.update(grads, policy_state.opt_state, params)
     new_actor_params = optax.apply_updates(params, updates)
@@ -174,9 +212,14 @@ def actor_step(
 
 
 def bundle_policy_state(state: training_utils.TrainState) -> dict[str, Any]:
+    """Bundle only the actor params and optimizer state.
+
+    The VLA backbone is frozen and reloaded from the Stage-1 checkpoint on every
+    run, so we only need to persist the small RL-specific weights.
+    """
     return {
         "step": jnp.asarray(state.step),
-        "params": state.params.to_pure_dict(),
+        "actor_params": state.params.filter(actor_filter()).to_pure_dict(),
         "opt_state": state.opt_state,
     }
 
@@ -186,11 +229,20 @@ def restore_policy_state(
     bundle: dict[str, Any],
     learning_rate: float,
 ) -> training_utils.TrainState:
+    """Restore a Stage-2 policy state.
+
+    The VLA backbone is taken from `model` (already loaded from the Stage-1
+    checkpoint by the caller).  Only the actor weights are overwritten from
+    `bundle`.
+    """
     state = init_policy_state(model, learning_rate)
-    pure_params = bundle["params"]
-    params = nnx.state(model)
-    params.replace_by_pure_dict(pure_params)
-    return dataclasses.replace(state, step=bundle["step"], params=params, opt_state=bundle["opt_state"])
+    # Rebuild a temporary model so we can do a targeted actor-only update.
+    tmp_model = nnx.merge(state.model_def, state.params)
+    actor_params = nnx.state(tmp_model).filter(actor_filter())
+    actor_params.replace_by_pure_dict(bundle["actor_params"])
+    nnx.update(tmp_model, actor_params)
+    new_params = nnx.state(tmp_model)
+    return dataclasses.replace(state, step=bundle["step"], params=new_params, opt_state=bundle["opt_state"])
 
 
 def bundle_critic_state(state: CriticTrainState) -> dict[str, Any]:

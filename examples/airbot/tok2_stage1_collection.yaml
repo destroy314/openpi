@@ -1,45 +1,47 @@
 robot:
-  type: airbot_TOK2_follower
-  port: can0
-  id: airbot_TOK2_follower
+  type: airbot_PTK_follower
+  left_arm_port: can_left
+  right_arm_port: can_right
+  id: PTK_follower
   cameras:
     cam_high:
       type: opencv
-      index_or_path: "/dev/video0"
+      index_or_path: "/dev/video6"
       width: 640
       height: 480
-      fps: 30
+      fps: 25
       rotation: NO_ROTATION
     cam_left_wrist:
       type: opencv
       index_or_path: "/dev/video2"
       width: 640
       height: 480
-      fps: 30
+      fps: 25
       rotation: NO_ROTATION
     cam_right_wrist:
       type: opencv
-      index_or_path: "/dev/video4"
+      index_or_path: "/dev/video0"
       width: 640
       height: 480
-      fps: 30
+      fps: 25
       rotation: NO_ROTATION
 
 teleop:
-  type: airbot_TOK2_leader
-  port: can1
-  id: airbot_TOK2_leader
+  type: airbot_PTK_leader
+  left_arm_port: can_left_lead
+  right_arm_port: can_right_lead
+  id: PTK_leader
 
 run:
-  fps: 30
+  fps: 25
   display_data: true
-  num_episodes: 50
+  num_episodes: 30
   episode_time_sec: 40
   reset_time_sec: 30
-  single_task: "place the object into the target area"
+  single_task: "do the task"
 
 dataset:
-  repo_id: your_hf_username/airbot_tok2_pick_place_raw
+  repo_id: detroy314/block_handover
   video: true
   num_image_writer_processes: 0
   num_image_writer_threads_per_camera: 4
