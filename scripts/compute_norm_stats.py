@@ -99,7 +99,7 @@ def main(config_name: str, max_frames: int | None = None):
             data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
         )
 
-    keys = ["state", "actions"]
+    keys = list(_config.get_norm_stats_keys(data_config))
     stats = {key: normalize.RunningStats() for key in keys}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):

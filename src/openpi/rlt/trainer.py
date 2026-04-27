@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import pathlib
 from typing import Any
 
 import flax.nnx as nnx
@@ -7,17 +8,20 @@ import flax.traverse_util
 import jax
 import jax.numpy as jnp
 import optax
-import numpy as np
 
 from openpi.rlt import actor_critic as _actor_critic
 from openpi.shared import nnx_utils
-from openpi.training import utils as training_utils
+
+
+_ACTOR_SAMPLE_DEBUG = False
+_ACTOR_SAMPLE_DEBUG_FILE: pathlib.Path | None = None
+_ACTOR_SAMPLE_LOGGER = logging.getLogger("openpi.rlt.actor_sample")
 
 
 @dataclasses.dataclass(frozen=True)
 class OnlineRLTConfig:
     discount: float = 0.99
-    actor_bc_weight: float = 0.1
+    actor_bc_weight: float = 1.0
     reference_dropout: float = 0.5
     actor_update_interval: int = 2
     target_tau: float = 0.005
@@ -32,22 +36,142 @@ class CriticTrainState:
     tx: optax.GradientTransformation = dataclasses.field(repr=False)
 
 
+@dataclasses.dataclass
+class ActorTrainState:
+    step: int
+    params: Any
+    opt_state: Any
+    tx: optax.GradientTransformation = dataclasses.field(repr=False)
+
+
+def set_actor_sample_debug(enabled: bool, *, log_path: str | pathlib.Path | None = None) -> None:
+    global _ACTOR_SAMPLE_DEBUG
+    global _ACTOR_SAMPLE_DEBUG_FILE
+    _ACTOR_SAMPLE_DEBUG = enabled
+    _ACTOR_SAMPLE_DEBUG_FILE = pathlib.Path(log_path) if log_path is not None else None
+    _ACTOR_SAMPLE_LOGGER.setLevel(logging.INFO)
+    _ACTOR_SAMPLE_LOGGER.propagate = False
+    _ACTOR_SAMPLE_LOGGER.handlers.clear()
+    if not enabled:
+        return
+    if _ACTOR_SAMPLE_DEBUG_FILE is not None:
+        _ACTOR_SAMPLE_DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(_ACTOR_SAMPLE_DEBUG_FILE, encoding="utf-8")
+    else:
+        handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    _ACTOR_SAMPLE_LOGGER.addHandler(handler)
+
+
+def _emit_actor_sample_stats(
+    debug_label: str,
+    debug_step: int,
+    state_mean: float,
+    state_std: float,
+    state_max_abs: float,
+    reference_mean: float,
+    reference_std: float,
+    reference_max_abs: float,
+    delta_mean: float,
+    delta_std: float,
+    delta_max_abs: float,
+    mean_out_mean: float,
+    mean_out_std: float,
+    mean_out_max_abs: float,
+) -> None:
+    prefix = []
+    if debug_label:
+        prefix.append(debug_label)
+    if debug_step >= 0:
+        prefix.append(f"learner_step={debug_step}")
+    prefix_text = f"[{' '.join(prefix)}] " if prefix else ""
+    lines = [
+        f"{prefix_text}actor_sample | state     : mean={state_mean:.4f} std={state_std:.4f} max_abs={state_max_abs:.4f}",
+        f"{prefix_text}actor_sample | ref_action: mean={reference_mean:.4f} std={reference_std:.4f} max_abs={reference_max_abs:.4f}",
+        f"{prefix_text}actor_sample | delta     : mean={delta_mean:.4f} std={delta_std:.4f} max_abs={delta_max_abs:.4f}",
+        f"{prefix_text}actor_sample | mean_out  : mean={mean_out_mean:.4f} std={mean_out_std:.4f} max_abs={mean_out_max_abs:.4f}",
+    ]
+    for line in lines:
+        _ACTOR_SAMPLE_LOGGER.info(line)
+
+
+def log_debug(message: str, *args: Any) -> None:
+    _ACTOR_SAMPLE_LOGGER.info(message, *args)
+
+
+def _maybe_log_actor_sample_stats(
+    state: jax.Array,
+    reference_action: jax.Array,
+    mean: jax.Array,
+    *,
+    debug_step: jax.Array | int | None = None,
+    debug_label: str = "",
+) -> None:
+    if not _ACTOR_SAMPLE_DEBUG:
+        return
+    delta = mean - reference_action
+    callback = lambda *args: _emit_actor_sample_stats(debug_label, *args)
+    state_mean = jnp.mean(state)
+    state_std = jnp.std(state)
+    state_max_abs = jnp.max(jnp.abs(state))
+    reference_mean = jnp.mean(reference_action)
+    reference_std = jnp.std(reference_action)
+    reference_max_abs = jnp.max(jnp.abs(reference_action))
+    delta_mean = jnp.mean(delta)
+    delta_std = jnp.std(delta)
+    delta_max_abs = jnp.max(jnp.abs(delta))
+    mean_out_mean = jnp.mean(mean)
+    mean_out_std = jnp.std(mean)
+    mean_out_max_abs = jnp.max(jnp.abs(mean))
+    debug_step_value = jnp.asarray(-1 if debug_step is None else debug_step)
+    jax.debug.callback(
+        callback,
+        debug_step_value,
+        state_mean,
+        state_std,
+        state_max_abs,
+        reference_mean,
+        reference_std,
+        reference_max_abs,
+        delta_mean,
+        delta_std,
+        delta_max_abs,
+        mean_out_mean,
+        mean_out_std,
+        mean_out_max_abs,
+    )
+
+
 def actor_filter() -> nnx.filterlib.Filter:
     return nnx_utils.PathRegex(".*rlt_actor.*")
 
 
-def init_policy_state(model, learning_rate: float) -> training_utils.TrainState:
+def extract_actor_params(model) -> dict[str, Any]:
+    return nnx.state(model).filter(actor_filter()).to_pure_dict()["rlt_actor"]
+
+
+def init_actor_state(
+    rng: jax.Array,
+    state_dim: int,
+    action_dim: int,
+    *,
+    hidden_dim: int = 256,
+    learning_rate: float = 3e-4,
+) -> tuple[_actor_critic.GaussianActor, ActorTrainState]:
+    actor = _actor_critic.GaussianActor(action_dim=action_dim, hidden_dim=hidden_dim)
+    params = actor.init(
+        rng,
+        jnp.ones((1, state_dim), dtype=jnp.float32),
+        jnp.ones((1, action_dim), dtype=jnp.float32),
+    )["params"]
     tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate))
-    params = nnx.state(model)
-    return training_utils.TrainState(
-        step=jnp.asarray(0),
+    state = ActorTrainState(
+        step=0,
         params=params,
-        model_def=nnx.graphdef(model),
+        opt_state=tx.init(params),
         tx=tx,
-        opt_state=tx.init(params.filter(actor_filter())),
-        ema_decay=None,
-        ema_params=None,
     )
+    return actor, state
 
 
 def init_critic_state(
@@ -80,36 +204,24 @@ def _apply_reference_dropout(reference_action: jax.Array, rng: jax.Array, prob: 
     return jnp.where(drop_mask, 0.0, reference_action)
 
 
-def actor_mean(model, state: jax.Array, reference_action: jax.Array) -> jax.Array:
-    mean, _ = model.rlt_actor(state, reference_action)
-    return mean
-
-
-def actor_sample(
-    model,
+def actor_sample_params(
+    actor_model: _actor_critic.GaussianActor,
+    actor_params: Any,
     state: jax.Array,
     reference_action: jax.Array,
     rng: jax.Array,
     *,
     deterministic: bool = False,
+    debug_step: jax.Array | int | None = None,
+    debug_label: str = "",
 ) -> jax.Array:
-    mean, std = model.rlt_actor(state, reference_action)
-    delta = mean - reference_action
-    jax.debug.print(
-        "actor_sample | state     : mean={m:.4f} std={s:.4f} max_abs={mx:.4f}",
-        m=jnp.mean(state), s=jnp.std(state), mx=jnp.max(jnp.abs(state)),
-    )
-    jax.debug.print(
-        "actor_sample | ref_action: mean={m:.4f} std={s:.4f} max_abs={mx:.4f}",
-        m=jnp.mean(reference_action), s=jnp.std(reference_action), mx=jnp.max(jnp.abs(reference_action)),
-    )
-    jax.debug.print(
-        "actor_sample | delta     : mean={m:.4f} std={s:.4f} max_abs={mx:.4f}",
-        m=jnp.mean(delta), s=jnp.std(delta), mx=jnp.max(jnp.abs(delta)),
-    )
-    jax.debug.print(
-        "actor_sample | mean_out  : mean={m:.4f} std={s:.4f} max_abs={mx:.4f}",
-        m=jnp.mean(mean), s=jnp.std(mean), mx=jnp.max(jnp.abs(mean)),
+    mean, std = actor_model.apply({"params": actor_params}, state, reference_action)
+    _maybe_log_actor_sample_stats(
+        state,
+        reference_action,
+        mean,
+        debug_step=debug_step,
+        debug_label=debug_label,
     )
     if deterministic:
         return mean
@@ -117,16 +229,24 @@ def actor_sample(
     return mean + noise * std
 
 
-def critic_step(
+def critic_step_with_actor(
+    actor_model: _actor_critic.GaussianActor,
+    actor_state: ActorTrainState,
     critic_model: _actor_critic.TwinCritic,
     critic_state: CriticTrainState,
-    policy_state: training_utils.TrainState,
     batch,
     rng: jax.Array,
     config: OnlineRLTConfig,
 ) -> tuple[CriticTrainState, dict[str, jax.Array]]:
-    model = nnx.merge(policy_state.model_def, policy_state.params)
-    next_action = actor_sample(model, batch.next_state, batch.next_reference_action, rng)
+    next_action = actor_sample_params(
+        actor_model,
+        actor_state.params,
+        batch.next_state,
+        batch.next_reference_action,
+        rng,
+        debug_step=actor_state.step,
+        debug_label="critic_step",
+    )
     target_q1, target_q2 = critic_model.apply({"params": critic_state.target_params}, batch.next_state, next_action)
     bootstrap_discount = jnp.power(config.discount, batch.bootstrap_steps.astype(jnp.float32))
     target_q = batch.reward + bootstrap_discount * (1.0 - batch.done) * jnp.minimum(target_q1, target_q2)
@@ -138,15 +258,19 @@ def critic_step(
 
     (loss, (q1, q2)), grads = jax.value_and_grad(loss_fn, has_aux=True)(critic_state.params)
     grad_norm = optax.global_norm(grads)
-    logging.info(
+    log_debug(
         "critic_step | target_q: mean=%.4f std=%.4f max_abs=%.4f",
         float(jnp.mean(target_q)), float(jnp.std(target_q)), float(jnp.max(jnp.abs(target_q))),
     )
-    logging.info(
+    log_debug(
         "critic_step | q1      : mean=%.4f std=%.4f max_abs=%.4f",
         float(jnp.mean(q1)), float(jnp.std(q1)), float(jnp.max(jnp.abs(q1))),
     )
-    logging.info(
+    log_debug(
+        "critic_step | q2      : mean=%.4f std=%.4f max_abs=%.4f",
+        float(jnp.mean(q2)), float(jnp.std(q2)), float(jnp.max(jnp.abs(q2))),
+    )
+    log_debug(
         "critic_step | loss=%.4f grad_norm=%.4f",
         float(loss), float(grad_norm),
     )
@@ -168,81 +292,83 @@ def critic_step(
     return new_state, info
 
 
-def actor_step(
+def actor_step_with_actor(
+    actor_model: _actor_critic.GaussianActor,
     critic_model: _actor_critic.TwinCritic,
     critic_state: CriticTrainState,
-    policy_state: training_utils.TrainState,
+    actor_state: ActorTrainState,
     batch,
     rng: jax.Array,
     config: OnlineRLTConfig,
-) -> tuple[training_utils.TrainState, dict[str, jax.Array]]:
-    model = nnx.merge(policy_state.model_def, policy_state.params)
-
-    def loss_fn(model_with_actor, rngs):
+) -> tuple[ActorTrainState, dict[str, jax.Array]]:
+    def loss_fn(params, rngs):
         dropout_rng, sample_rng = rngs
         dropped_reference = _apply_reference_dropout(batch.reference_action, dropout_rng, config.reference_dropout)
-        actions = actor_sample(model_with_actor, batch.state, dropped_reference, sample_rng)
+        actions = actor_sample_params(
+            actor_model,
+            params,
+            batch.state,
+            dropped_reference,
+            sample_rng,
+            debug_step=actor_state.step,
+            debug_label="learner_actor",
+        )
         q1, q2 = critic_model.apply({"params": critic_state.params}, batch.state, actions)
         q = jnp.minimum(q1, q2)
         bc_penalty = jnp.mean(jnp.square(actions - batch.reference_action), axis=-1)
         return jnp.mean(-q + config.actor_bc_weight * bc_penalty)
 
-    diff_state = nnx.DiffState(0, actor_filter())
     rngs = jax.random.split(rng, 2)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, rngs)
-    actor_grads = grads.filter(actor_filter())
-    grad_norm = optax.global_norm(actor_grads.to_pure_dict())
-    logging.info(
+    loss, grads = jax.value_and_grad(loss_fn)(actor_state.params, rngs)
+    grad_norm = optax.global_norm(grads)
+    log_debug(
         "actor_step | actor_loss=%.4f grad_norm=%.4f",
         float(loss), float(grad_norm),
     )
-    params = policy_state.params.filter(actor_filter())
-    updates, new_opt_state = policy_state.tx.update(grads, policy_state.opt_state, params)
-    new_actor_params = optax.apply_updates(params, updates)
-    nnx.update(model, new_actor_params)
-    new_params = nnx.state(model)
-    new_state = dataclasses.replace(
-        policy_state,
-        step=policy_state.step + 1,
+    updates, new_opt_state = actor_state.tx.update(grads, actor_state.opt_state, actor_state.params)
+    new_params = optax.apply_updates(actor_state.params, updates)
+    new_state = ActorTrainState(
+        step=actor_state.step + 1,
         params=new_params,
         opt_state=new_opt_state,
+        tx=actor_state.tx,
     )
     info = {"actor_loss": loss}
     return new_state, info
 
 
-def bundle_policy_state(state: training_utils.TrainState) -> dict[str, Any]:
-    """Bundle only the actor params and optimizer state.
-
-    The VLA backbone is frozen and reloaded from the Stage-1 checkpoint on every
-    run, so we only need to persist the small RL-specific weights.
-    """
+def bundle_actor_params(state: ActorTrainState) -> dict[str, Any]:
     return {
         "step": jnp.asarray(state.step),
-        "actor_params": state.params.filter(actor_filter()).to_pure_dict(),
+        "actor_params": state.params,
+    }
+
+
+def apply_actor_params(state: ActorTrainState, bundle: dict[str, Any]) -> ActorTrainState:
+    return dataclasses.replace(state, step=int(bundle["step"]), params=bundle["actor_params"])
+
+
+def bundle_actor_train_state(state: ActorTrainState) -> dict[str, Any]:
+    return {
+        "step": jnp.asarray(state.step),
+        "actor_params": state.params,
         "opt_state": state.opt_state,
     }
 
 
-def restore_policy_state(
-    model,
+def restore_actor_state(
+    actor_model: _actor_critic.GaussianActor,
     bundle: dict[str, Any],
     learning_rate: float,
-) -> training_utils.TrainState:
-    """Restore a Stage-2 policy state.
-
-    The VLA backbone is taken from `model` (already loaded from the Stage-1
-    checkpoint by the caller).  Only the actor weights are overwritten from
-    `bundle`.
-    """
-    state = init_policy_state(model, learning_rate)
-    # Rebuild a temporary model so we can do a targeted actor-only update.
-    tmp_model = nnx.merge(state.model_def, state.params)
-    actor_params = nnx.state(tmp_model).filter(actor_filter())
-    actor_params.replace_by_pure_dict(bundle["actor_params"])
-    nnx.update(tmp_model, actor_params)
-    new_params = nnx.state(tmp_model)
-    return dataclasses.replace(state, step=bundle["step"], params=new_params, opt_state=bundle["opt_state"])
+) -> ActorTrainState:
+    del actor_model
+    tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate))
+    return ActorTrainState(
+        step=int(bundle["step"]),
+        params=bundle["actor_params"],
+        opt_state=bundle["opt_state"],
+        tx=tx,
+    )
 
 
 def bundle_critic_state(state: CriticTrainState) -> dict[str, Any]:

@@ -70,6 +70,11 @@ class DataConfig:
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
+    # Keys to include when computing norm stats. If None, defaults to ("state", "actions").
+    # Keep this as a tuple union so tyro can round-trip tuple defaults from preset configs.
+    norm_stats_keys: tuple[str, ...] | None = None
+    # Keys that should not be normalized on the input path even if stats exist.
+    skip_norm_stats_keys: Sequence[str] = ()
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
@@ -97,6 +102,22 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+
+def get_norm_stats_keys(data_config: DataConfig) -> Sequence[str]:
+    if data_config.norm_stats_keys is None:
+        return ("state", "actions")
+    return data_config.norm_stats_keys
+
+
+def get_input_norm_stats(data_config: DataConfig) -> dict[str, _transforms.NormStats] | None:
+    norm_stats = data_config.norm_stats
+    if norm_stats is None or not data_config.skip_norm_stats_keys:
+        return norm_stats
+
+    excluded = set(data_config.skip_norm_stats_keys)
+    flat_stats = _transforms.flatten_dict(norm_stats)
+    return _transforms.unflatten_dict({key: value for key, value in flat_stats.items() if key not in excluded})
 
 
 class GroupFactory(Protocol):
@@ -283,7 +304,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 class LeRobotAirbotDataConfig(DataConfigFactory):
     """Airbot data config that reuses only the hardware-facing schema and transforms."""
 
-    use_delta_joint_actions: bool = False
+    use_delta_joint_actions: bool = True
     default_prompt: str | None = None
     require_proprio: bool = False
 
@@ -293,6 +314,9 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
     pad_action: bool = False
     crop_img_square: bool = False
     mask_wrist_cam_prob: float = 0.0
+    # Keep this as a tuple union so tyro can round-trip tuple defaults from preset configs.
+    norm_stats_keys: tuple[str, ...] | None = None
+    normalize_prompt_state: bool = True
 
     action_sequence_keys: Sequence[str] = ("action",)
 
@@ -344,6 +368,8 @@ class LeRobotAirbotDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+            norm_stats_keys=self.norm_stats_keys,
+            skip_norm_stats_keys=() if self.normalize_prompt_state else ("prompt_state",),
         )
 
 
@@ -1001,12 +1027,17 @@ _CONFIGS = [
             rlt_recon_weight=0.02,
             rlt_action_horizon=10,
             rlt_env_action_dim=14,
+            rlt_proprio_dim=28,
         ),
         data=LeRobotAirbotDataConfig(
-            repo_id="icrlab/block_handover",
+            repo_id="icrlab/block_handover_proprio",
             assets=AssetsConfig(asset_id="airbot"),
             base_config=DataConfig(prompt_from_task=True),
             crop_img_square=True,
+            require_proprio=True,
+            # require_proprio=False, # set this when using rollout script
+            norm_stats_keys=("prompt_state", "proprio", "state", "actions"),
+            # normalize_prompt_state=False, # to compatible with old ckpt
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         freeze_filter=pi0_config.Pi0Config(
@@ -1018,6 +1049,7 @@ _CONFIGS = [
             use_rlt=True,
             rlt_action_horizon=10,
             rlt_env_action_dim=14,
+            rlt_proprio_dim=28,
         ).get_freeze_filter(),
         batch_size=32,
         num_train_steps=10_000,
@@ -1038,6 +1070,7 @@ _CONFIGS = [
             rlt_actor_enabled=True,
             rlt_action_horizon=10,
             rlt_env_action_dim=14,
+            rlt_proprio_dim=28,
         ),
         data=LeRobotAirbotDataConfig(
             repo_id="not/needed",  # unused by train_rlt_online.py; only asset_id matters
@@ -1045,6 +1078,8 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             crop_img_square=True,
             require_proprio=True,
+            norm_stats_keys=("prompt_state", "proprio", "state", "actions"),
+            # normalize_prompt_state=False, # to compatible with old ckpt
         ),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
@@ -1056,6 +1091,7 @@ _CONFIGS = [
             rlt_actor_enabled=True,
             rlt_action_horizon=10,
             rlt_env_action_dim=14,
+            rlt_proprio_dim=28,
         ).get_freeze_filter(),
         batch_size=32,
         ema_decay=None,
@@ -1109,25 +1145,6 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
-    ),
-    TrainConfig(
-        name="debug_pi05_rlt",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=14,
-            action_horizon=10,
-            paligemma_variant="dummy",
-            action_expert_variant="dummy",
-            use_rlt=True,
-            rlt_actor_enabled=True,
-        ),
-        data=FakeDataConfig(),
-        batch_size=2,
-        num_train_steps=10,
-        overwrite=True,
-        exp_name="debug_pi05_rlt",
-        wandb_enabled=False,
-        ema_decay=None,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

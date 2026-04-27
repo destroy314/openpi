@@ -105,12 +105,17 @@ class AirbotInputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         prompt_state = _expand_airbot_state(np.asarray(data["state"]))
         proprio = data.get("proprio")
+        expanded_proprio = None
         if proprio is None:
             if self.require_proprio:
                 raise ValueError("Airbot proprio is required when require_proprio=True.")
-            state = transforms.pad_to_dim(prompt_state, self.action_dim)
         else:
-            state = transforms.pad_to_dim(_expand_airbot_proprio(np.asarray(proprio)), self.action_dim)
+            expanded_proprio = _expand_airbot_proprio(np.asarray(proprio))
+
+        if self.model_type == _model.ModelType.PI0_FAST:
+            state = transforms.pad_to_dim(expanded_proprio if expanded_proprio is not None else prompt_state, self.action_dim)
+        else:
+            state = prompt_state.copy()
 
         in_images = data.get("images", {})
         base_image = (
@@ -140,9 +145,14 @@ class AirbotInputs(transforms.DataTransformFn):
             "state": state,
             "prompt_state": prompt_state,
         }
+        if expanded_proprio is not None:
+            inputs["proprio"] = expanded_proprio
 
         if "actions" in data:
-            inputs["actions"] = transforms.pad_to_dim(np.asarray(data["actions"]), self.action_dim)
+            actions = np.asarray(data["actions"])
+            if self.model_type == _model.ModelType.PI0_FAST:
+                actions = transforms.pad_to_dim(actions, self.action_dim)
+            inputs["actions"] = actions
 
         if "prompt" in data:
             prompt = data["prompt"]

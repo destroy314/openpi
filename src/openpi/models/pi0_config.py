@@ -41,7 +41,9 @@ class Pi0Config(_model.BaseModelConfig):
     rlt_token_depth: int = 2
     rlt_action_horizon: int | None = None
     rlt_env_action_dim: int | None = None
+    rlt_proprio_dim: int | None = None
     rlt_actor_hidden_dim: int = 256
+    rlt_actor_std: float = 0.01
     rlt_reference_dropout: float = 0.5
 
     def __post_init__(self):
@@ -53,6 +55,8 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "rlt_action_horizon", self.action_horizon)
         if self.rlt_env_action_dim is None:
             object.__setattr__(self, "rlt_env_action_dim", self.action_dim)
+        if self.rlt_proprio_dim is None:
+            object.__setattr__(self, "rlt_proprio_dim", self.action_dim)
         if self.use_rlt and not self.pi05:
             raise ValueError("RLT is only supported for PI0.5 configs.")
         if self.rlt_action_horizon > self.action_horizon:
@@ -102,6 +106,9 @@ class Pi0Config(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                proprio=(
+                    jax.ShapeDtypeStruct([batch_size, self.rlt_proprio_dim], jnp.float32) if self.use_rlt else None
+                ),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )

@@ -57,12 +57,38 @@ def test_pi05_rlt_model():
     loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
     assert loss.shape == (batch_size, config.action_horizon)
 
-    prefix_embeddings, rl_token, rlt_state, reference_actions = nnx_utils.module_jit(model.extract_rlt_features)(
+    prefix_embeddings, rl_token, reference_actions = nnx_utils.module_jit(model.extract_rlt_features)(
         key, obs, num_steps=3
     )
     assert prefix_embeddings.shape[0] == batch_size
     assert rl_token.shape == (batch_size, config.rlt_token_dim)
-    assert rlt_state.shape == (batch_size, config.rlt_token_dim + config.action_dim)
+    assert reference_actions.shape == (batch_size, config.action_horizon, config.action_dim)
+
+    actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=3)
+    assert actions.shape == (batch_size, config.action_horizon, config.action_dim)
+
+
+def test_pi05_rlt_model_without_actor():
+    key = jax.random.key(0)
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        use_rlt=True,
+        rlt_actor_enabled=False,
+        action_dim=14,
+        action_horizon=10,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(key)
+
+    batch_size = 2
+    obs = config.fake_obs(batch_size)
+
+    prefix_embeddings, rl_token, reference_actions = nnx_utils.module_jit(model.extract_rlt_features)(
+        key, obs, num_steps=3
+    )
+    assert prefix_embeddings.shape[0] == batch_size
+    assert rl_token.shape == (batch_size, config.rlt_token_dim)
     assert reference_actions.shape == (batch_size, config.action_horizon, config.action_dim)
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=3)
@@ -85,7 +111,7 @@ def test_pi05_rlt_actor_refinement():
 
     batch_size = 2
     obs = config.fake_obs(batch_size)
-    _, _, _, reference_actions = nnx_utils.module_jit(model.extract_rlt_features)(key, obs, num_steps=3)
+    _, _, reference_actions = nnx_utils.module_jit(model.extract_rlt_features)(key, obs, num_steps=3)
     assert reference_actions.shape == (batch_size, config.rlt_action_horizon, config.action_dim)
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=3)
     assert actions.shape == (batch_size, config.rlt_action_horizon, config.action_dim)
@@ -101,6 +127,7 @@ def test_pi05_rlt_actor_uses_env_action_dim():
         action_horizon=50,
         rlt_action_horizon=10,
         rlt_env_action_dim=14,
+        rlt_proprio_dim=28,
         paligemma_variant="dummy",
         action_expert_variant="dummy",
     )
@@ -108,7 +135,8 @@ def test_pi05_rlt_actor_uses_env_action_dim():
 
     batch_size = 2
     obs = config.fake_obs(batch_size)
-    _, _, _, reference_actions = nnx_utils.module_jit(model.extract_rlt_features)(key, obs, num_steps=3)
+    assert obs.proprio.shape == (batch_size, config.rlt_proprio_dim)
+    _, _, reference_actions = nnx_utils.module_jit(model.extract_rlt_features)(key, obs, num_steps=3)
     assert reference_actions.shape == (batch_size, config.rlt_action_horizon, config.rlt_env_action_dim)
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=3)
     assert actions.shape == (batch_size, config.rlt_action_horizon, config.rlt_env_action_dim)

@@ -69,6 +69,14 @@ def save_checkpoint(
     return step_dir
 
 
+def save_bundle(checkpoint_dir: pathlib.Path | str, item: str, bundle: dict[str, Any]) -> pathlib.Path:
+    item_dir = pathlib.Path(checkpoint_dir) / item
+    item_dir.parent.mkdir(parents=True, exist_ok=True)
+    with ocp.PyTreeCheckpointer() as checkpointer:
+        checkpointer.save(item_dir, bundle)
+    return item_dir
+
+
 def restore_bundle(checkpoint_dir: pathlib.Path | str, item: str) -> dict[str, Any]:
     item_dir = pathlib.Path(checkpoint_dir) / item
     with ocp.PyTreeCheckpointer() as checkpointer:

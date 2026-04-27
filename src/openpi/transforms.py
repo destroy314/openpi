@@ -150,6 +150,8 @@ class Unnormalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantiles: bool = False
+    # If true, require every stats key to be present in the data.
+    strict: bool = True
 
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
@@ -164,7 +166,7 @@ class Unnormalize(DataTransformFn):
             data,
             self.norm_stats,
             self._unnormalize_quantile if self.use_quantiles else self._unnormalize,
-            strict=True,
+            strict=self.strict,
         )
 
     def _unnormalize(self, x, stats: NormStats):

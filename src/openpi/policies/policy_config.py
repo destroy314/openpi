@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import pathlib
@@ -62,6 +63,8 @@ def create_trained_policy(
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    data_config = dataclasses.replace(data_config, norm_stats=norm_stats)
+    input_norm_stats = _config.get_input_norm_stats(data_config)
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
@@ -78,12 +81,12 @@ def create_trained_policy(
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
             *data_config.data_transforms.inputs,
-            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Normalize(input_norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm, strict=False),
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],

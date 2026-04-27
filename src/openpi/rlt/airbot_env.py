@@ -103,7 +103,7 @@ class AirbotRLTEnvConfig:
     )
     cameras: dict[str, CameraConfig] = dataclasses.field(
         default_factory=lambda: {
-            "cam_high": CameraConfig(index=6),
+            "cam_high": CameraConfig(index=4),
             "cam_left_wrist": CameraConfig(index=2),
             "cam_right_wrist": CameraConfig(index=0),
         }
@@ -256,11 +256,6 @@ class AirbotRLTEnv:
         for action in chunk:
             step_started = time.perf_counter()
             action_to_apply, intervened = self._operator.override_action(action, self._last_state.copy())
-            logging.info(
-                "Executed action: %s, intervened: %s",
-                np.array2string(action_to_apply, precision=2, separator=", "),
-                intervened,
-            )
             left_action, right_action = np.split(np.asarray(action_to_apply, dtype=np.float32), 2)
             left_future = self._executor.submit(self._left_arm.apply_action, left_action)
             right_future = self._executor.submit(self._right_arm.apply_action, right_action)

@@ -3,7 +3,8 @@ Convert AIRBOT MCAP dataset to LeRobot format.
 
 Adapted from the official airbot-pi0 convert_mcap_data_to_lerobot.py.
 Produces feature names compatible with this repo's data pipeline:
-  observation.state, action, observation.images.{cam_high,cam_left_wrist,cam_right_wrist}
+  observation.state, observation.proprio, action,
+  observation.images.{cam_high,cam_left_wrist,cam_right_wrist}
 
 Usage:
     uv run examples/airbot/convert_mcap_to_lerobot.py \\
@@ -73,6 +74,11 @@ DEFAULT_ACTION_TOPICS = [
     "/right/lead/eef/joint_state/position",
 ]
 
+DEFAULT_VELOCITY_TOPICS = [
+    "/left/follow/arm/joint_state/velocity",   # 6 joints
+    "/right/follow/arm/joint_state/velocity",  # 6 joints
+]
+
 # MCAP attachment name → LeRobot camera key
 DEFAULT_CAMERA_TOPICS: dict[str, str] = {
     "cam_high": "/env_camera/color/image_raw",
@@ -97,6 +103,37 @@ MOTOR_NAMES = [
     "right_gripper",
 ]
 
+PROPRIO_NAMES = [
+    "left_waist_pos",
+    "left_shoulder_pos",
+    "left_elbow_pos",
+    "left_forearm_roll_pos",
+    "left_wrist_angle_pos",
+    "left_wrist_rotate_pos",
+    "left_gripper_pos",
+    "right_waist_pos",
+    "right_shoulder_pos",
+    "right_elbow_pos",
+    "right_forearm_roll_pos",
+    "right_wrist_angle_pos",
+    "right_wrist_rotate_pos",
+    "right_gripper_pos",
+    "left_waist_vel",
+    "left_shoulder_vel",
+    "left_elbow_vel",
+    "left_forearm_roll_vel",
+    "left_wrist_angle_vel",
+    "left_wrist_rotate_vel",
+    "left_gripper_vel",
+    "right_waist_vel",
+    "right_shoulder_vel",
+    "right_elbow_vel",
+    "right_forearm_roll_vel",
+    "right_wrist_angle_vel",
+    "right_wrist_rotate_vel",
+    "right_gripper_vel",
+]
+
 LEROBOT_HOME = Path(os.getenv("LEROBOT_HOME", "~/.cache/huggingface/lerobot")).expanduser()
 
 
@@ -118,7 +155,6 @@ DEFAULT_DATASET_CONFIG = DatasetConfig()
 
 def create_empty_dataset(
     repo_id: str,
-    state_dim: int,
     action_dim: int,
     camera_shapes: dict[str, tuple],
     task_name: str,
@@ -129,8 +165,13 @@ def create_empty_dataset(
     features: dict = {
         "observation.state": {
             "dtype": "float32",
-            "shape": (state_dim,),
-            "names": [MOTOR_NAMES[:state_dim]],
+            "shape": (len(MOTOR_NAMES),),
+            "names": [MOTOR_NAMES],
+        },
+        "observation.proprio": {
+            "dtype": "float32",
+            "shape": (len(PROPRIO_NAMES),),
+            "names": [PROPRIO_NAMES],
         },
         "action": {
             "dtype": "float32",
@@ -205,16 +246,13 @@ def _read_task_name(mcap_path: Path) -> str:
 
 def _probe_dims(
     mcap_path: Path,
-    state_topics: list[str],
     action_topics: list[str],
     camera_topics: dict[str, str],
-) -> tuple[int, int, dict[str, tuple]]:
-    """Read one MCAP file to determine state_dim, action_dim, and camera shapes."""
+) -> tuple[int, dict[str, tuple]]:
+    """Read one MCAP file to determine action_dim and camera shapes."""
     fbs_decoder = FloatArray.GetRootAsFloatArray
-    state_dim = 0
     action_dim = 0
     camera_shapes: dict[str, tuple] = {}
-    all_topics = state_topics + action_topics
 
     with mcap_path.open("rb") as f:
         reader = make_reader(f)
@@ -238,25 +276,57 @@ def _probe_dims(
                 except OSError:
                     pass
 
-        # State/action dims from first messages
+        # Action dims from first messages
         seen: set[str] = set()
-        for schema_obj, channel_obj, message_obj in reader.iter_messages(topics=all_topics):
+        for schema_obj, channel_obj, message_obj in reader.iter_messages(topics=action_topics):
             if channel_obj.topic in seen:
                 continue
             seen.add(channel_obj.topic)
             vals = fbs_decoder(message_obj.data).ValuesAsNumpy()
-            if channel_obj.topic in state_topics:
-                state_dim += len(vals)
-            else:
-                action_dim += len(vals)
-            if len(seen) == len(all_topics):
+            action_dim += len(vals)
+            if len(seen) == len(action_topics):
                 break
 
     missing = [c for c in camera_topics if c not in camera_shapes]
     if missing:
         raise ValueError(f"Camera attachments not found: {missing}")
 
-    return state_dim, action_dim, camera_shapes
+    return action_dim, camera_shapes
+
+
+def _build_proprio(
+    state_msg: dict[str, np.ndarray],
+    velocity_msg: dict[str, np.ndarray],
+    prev_gripper_pos: np.ndarray | None,
+    fps: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    left_arm_pos = state_msg["/left/follow/arm/joint_state/position"]
+    left_gripper_pos = state_msg["/left/follow/eef/joint_state/position"]
+    right_arm_pos = state_msg["/right/follow/arm/joint_state/position"]
+    right_gripper_pos = state_msg["/right/follow/eef/joint_state/position"]
+
+    left_arm_vel = np.nan_to_num(velocity_msg["/left/follow/arm/joint_state/velocity"], nan=0.0)
+    right_arm_vel = np.nan_to_num(velocity_msg["/right/follow/arm/joint_state/velocity"], nan=0.0)
+
+    current_gripper_pos = np.array([left_gripper_pos[0], right_gripper_pos[0]], dtype=np.float32)
+    if prev_gripper_pos is None:
+        gripper_vel = np.zeros((2,), dtype=np.float32)
+    else:
+        gripper_vel = (current_gripper_pos - prev_gripper_pos) * fps
+
+    proprio = np.concatenate(
+        [
+            left_arm_pos,
+            left_gripper_pos,
+            right_arm_pos,
+            right_gripper_pos,
+            left_arm_vel,
+            gripper_vel[:1],
+            right_arm_vel,
+            gripper_vel[1:],
+        ]
+    ).astype(np.float32)
+    return proprio, current_gripper_pos
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +338,13 @@ def _process_episode(
     dataset: LeRobotDataset,
     state_topics: list[str],
     action_topics: list[str],
+    velocity_topics: list[str],
     camera_topics: dict[str, str],
     task_name: str,
+    fps: int,
 ) -> None:
     fbs_decoder = FloatArray.GetRootAsFloatArray
-    all_topics = state_topics + action_topics
+    all_topics = state_topics + action_topics + velocity_topics
     # Reverse map: attachment name → cam key
     attach_to_cam = {v: k for k, v in camera_topics.items()}
 
@@ -296,17 +368,22 @@ def _process_episode(
             cnt_topics: dict[str, int] = {t: 0 for t in all_topics}
             state_msg: dict[str, np.ndarray] = {}
             action_msg: dict[str, np.ndarray] = {}
+            velocity_msg: dict[str, np.ndarray] = {}
             frame_cnt = 0
+            prev_gripper_pos: np.ndarray | None = None
 
             for schema_obj, channel_obj, message_obj in reader.iter_messages(topics=all_topics):
                 topic = channel_obj.topic
                 cnt_topics[topic] += 1
 
                 if cnt_topics[topic] - frame_cnt == 2:
-                    _add_frame(
-                        dataset, state_msg, action_msg, cam_tmp,
-                        state_topics, action_topics, frame_cnt, task_name,
+                    current_gripper_pos = _add_frame(
+                        dataset, state_msg, action_msg, velocity_msg, cam_tmp,
+                        state_topics, action_topics, velocity_topics, frame_cnt, task_name,
+                        prev_gripper_pos, fps,
                     )
+                    if current_gripper_pos is not None:
+                        prev_gripper_pos = current_gripper_pos
                     frame_cnt += 1
 
                 vals = fbs_decoder(message_obj.data).ValuesAsNumpy()
@@ -314,11 +391,14 @@ def _process_episode(
                     state_msg[topic] = vals
                 elif topic in action_topics:
                     action_msg[topic] = vals
+                elif topic in velocity_topics:
+                    velocity_msg[topic] = vals
 
             # Save the last frame
             _add_frame(
-                dataset, state_msg, action_msg, cam_tmp,
-                state_topics, action_topics, frame_cnt, task_name,
+                dataset, state_msg, action_msg, velocity_msg, cam_tmp,
+                state_topics, action_topics, velocity_topics, frame_cnt, task_name,
+                prev_gripper_pos, fps,
             )
             dataset.save_episode()
 
@@ -334,27 +414,37 @@ def _add_frame(
     dataset: LeRobotDataset,
     state_msg: dict[str, np.ndarray],
     action_msg: dict[str, np.ndarray],
+    velocity_msg: dict[str, np.ndarray],
     cam_tmp: dict[str, str],
     state_topics: list[str],
     action_topics: list[str],
+    velocity_topics: list[str],
     frame_idx: int,
     task_name: str,
-) -> None:
+    prev_gripper_pos: np.ndarray | None,
+    fps: int,
+) -> np.ndarray | None:
     # Check all topics have data
     for t in state_topics:
         if t not in state_msg:
             print(f"  Warning: missing state topic {t} at frame {frame_idx}, skipping")
-            return
+            return None
     for t in action_topics:
         if t not in action_msg:
             print(f"  Warning: missing action topic {t} at frame {frame_idx}, skipping")
-            return
+            return None
+    for t in velocity_topics:
+        if t not in velocity_msg:
+            print(f"  Warning: missing velocity topic {t} at frame {frame_idx}, skipping")
+            return None
 
     state_vec = np.concatenate([state_msg[t] for t in state_topics]).astype(np.float32)
+    proprio_vec, current_gripper_pos = _build_proprio(state_msg, velocity_msg, prev_gripper_pos, fps)
     action_vec = np.concatenate([action_msg[t] for t in action_topics]).astype(np.float32)
 
     frame: dict = {
         "observation.state": state_vec,
+        "observation.proprio": proprio_vec,
         "action": action_vec,
         "task": task_name,
     }
@@ -362,6 +452,7 @@ def _add_frame(
         frame[f"observation.images.{cam_key}"] = _read_frame(tmp_path, frame_idx)
 
     dataset.add_frame(frame)
+    return current_gripper_pos
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +484,7 @@ def convert_mcap_to_lerobot(
     """
     state_topics = DEFAULT_STATE_TOPICS
     action_topics = DEFAULT_ACTION_TOPICS
+    velocity_topics = DEFAULT_VELOCITY_TOPICS
     camera_topics = DEFAULT_CAMERA_TOPICS
 
     mcap_files = _find_mcap_files(mcap_dir)
@@ -405,10 +497,10 @@ def convert_mcap_to_lerobot(
 
     # Probe dimensions from first file
     print(f"Probing dimensions from {mcap_files[0].name} ...")
-    state_dim, action_dim, camera_shapes = _probe_dims(
-        mcap_files[0], state_topics, action_topics, camera_topics
+    action_dim, camera_shapes = _probe_dims(
+        mcap_files[0], action_topics, camera_topics
     )
-    print(f"  state_dim={state_dim}, action_dim={action_dim}")
+    print(f"  proprio_dim={len(PROPRIO_NAMES)}, action_dim={action_dim}")
     print(f"  camera_shapes={camera_shapes}")
 
     # Read task name from metadata if not provided
@@ -418,7 +510,6 @@ def convert_mcap_to_lerobot(
 
     dataset = create_empty_dataset(
         repo_id=repo_id,
-        state_dim=state_dim,
         action_dim=action_dim,
         camera_shapes=camera_shapes,
         task_name=task_name,
@@ -431,8 +522,9 @@ def convert_mcap_to_lerobot(
         try:
             _process_episode(
                 mcap_path, dataset,
-                state_topics, action_topics, camera_topics,
+                state_topics, action_topics, velocity_topics, camera_topics,
                 task_name,
+                fps,
             )
         except Exception as e:
             print(f"Error processing {mcap_path.name}: {e}")

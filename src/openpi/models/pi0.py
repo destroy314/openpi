@@ -121,18 +121,20 @@ class Pi0(_model.BaseModel):
             )
             self.rlt_token_module = rlt_token
 
-            rlt_actor = nnx_bridge.ToNNX(
-                _rlt_actor_critic.GaussianActor(
-                    action_dim=self.rlt_env_action_dim * self.rlt_action_horizon,
-                    hidden_dim=config.rlt_actor_hidden_dim,
+            if self.rlt_actor_enabled:
+                rlt_actor = nnx_bridge.ToNNX(
+                    _rlt_actor_critic.GaussianActor(
+                        action_dim=self.rlt_env_action_dim * self.rlt_action_horizon,
+                        hidden_dim=config.rlt_actor_hidden_dim,
+                        init_std=config.rlt_actor_std,
+                    )
                 )
-            )
-            rlt_actor.lazy_init(
-                jnp.ones((1, config.rlt_token_dim + config.action_dim), dtype=jnp.float32),
-                jnp.ones((1, self.rlt_env_action_dim * self.rlt_action_horizon), dtype=jnp.float32),
-                rngs=rngs,
-            )
-            self.rlt_actor = rlt_actor
+                rlt_actor.lazy_init(
+                    jnp.ones((1, config.rlt_token_dim + config.rlt_proprio_dim), dtype=jnp.float32),
+                    jnp.ones((1, self.rlt_env_action_dim * self.rlt_action_horizon), dtype=jnp.float32),
+                    rngs=rngs,
+                )
+                self.rlt_actor = rlt_actor
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -383,7 +385,6 @@ class Pi0(_model.BaseModel):
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Float[at.Array, "b d"],
-        at.Float[at.Array, "b d"],
         _model.Actions,
     ]:
         if not self.use_rlt:
@@ -400,8 +401,7 @@ class Pi0(_model.BaseModel):
         )
         reference_actions = reference_actions[:, : self.rlt_action_horizon, : self.rlt_env_action_dim]
         rl_token, _ = self.compute_rl_token(prefix_out, prefix_rlt_mask)
-        rlt_state = jnp.concatenate([rl_token, observation.state], axis=-1)
-        return prefix_out, rl_token, rlt_state, reference_actions
+        return prefix_out, rl_token, reference_actions
 
     @override
     def sample_actions(
@@ -427,7 +427,7 @@ class Pi0(_model.BaseModel):
 
         reference_actions = reference_actions[:, : self.rlt_action_horizon, : self.rlt_env_action_dim]
         rl_token, _ = self.compute_rl_token(prefix_out, prefix_rlt_mask)
-        rlt_state = jnp.concatenate([rl_token, observation.state], axis=-1)
+        rlt_state = jnp.concatenate([rl_token, observation.proprio], axis=-1)
         flat_reference_actions = reference_actions.reshape(reference_actions.shape[0], -1)
         refined_actions, _ = self.rlt_actor(rlt_state, flat_reference_actions)
         return refined_actions.reshape(reference_actions.shape)

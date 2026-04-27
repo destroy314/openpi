@@ -21,7 +21,6 @@ import logging
 import pathlib
 from typing import Any
 
-import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -172,11 +171,11 @@ def _flush_ready_chunks(
 
 
 def _actor_action(
-    policy_state, rng: jax.Array, state: np.ndarray, reference_action: np.ndarray
+    actor_model, actor_state, rng: jax.Array, state: np.ndarray, reference_action: np.ndarray
 ) -> np.ndarray:
-    model = nnx.merge(policy_state.model_def, policy_state.params)
-    action = _trainer.actor_sample(
-        model,
+    action = _trainer.actor_sample_params(
+        actor_model,
+        actor_state.params,
         jnp.asarray(state)[None, ...],
         jnp.asarray(reference_action)[None, ...],
         rng,
@@ -205,6 +204,7 @@ def _compute_frame_features(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract (rlt_state, reference_action) from a single dataset frame."""
     sample = transformed_dataset[frame_idx]
+    proprio = sample.get("proprio")
     batched: dict[str, Any] = {}
     for k, v in sample.items():
         if isinstance(v, dict):
@@ -216,10 +216,16 @@ def _compute_frame_features(
             batched[k] = _to_jax(v)[None]
         # skip non-array values (e.g. strings)
     obs = _model_module.Observation.from_dict(batched)
-    _, _, rlt_state, reference_actions = extract_features(
+    _, rl_token, reference_actions = extract_features(
         rng, obs, num_steps=diffusion_steps
     )
-    state = np.asarray(rlt_state[0], dtype=np.float32)
+    state = np.concatenate(
+        [
+            np.asarray(rl_token[0], dtype=np.float32),
+            np.asarray(proprio, dtype=np.float32),
+        ],
+        axis=-1,
+    )
     reference = np.asarray(reference_actions[0].reshape(-1), dtype=np.float32)
     return state, reference
 
@@ -259,6 +265,7 @@ def _build_episode_index(
 
 def main(args: Args) -> None:
     logging.basicConfig(level=logging.INFO, force=True)
+    _trainer.set_actor_sample_debug(True)
 
     # ── Stage 2 model config ──────────────────────────────────────────────
     train_config = _config.get_config(args.config)
@@ -281,7 +288,15 @@ def main(args: Args) -> None:
 
     # ── Load Stage 1 model ────────────────────────────────────────────────
     logging.info("Loading Stage 1 model from %s ...", args.init_checkpoint_dir)
-    policy = _policy_config.create_trained_policy(train_config, args.init_checkpoint_dir)
+    stage1_policy_config = train_config
+    if getattr(train_config.model, "use_rlt", False) and getattr(train_config.model, "rlt_actor_enabled", False):
+        # Stage 2 only reuses the Stage 1 backbone/reference policy features. The online actor
+        # is always initialized separately below, so skip loading any historical rlt_actor params.
+        stage1_policy_config = dataclasses.replace(
+            train_config,
+            model=dataclasses.replace(train_config.model, rlt_actor_enabled=False),
+        )
+    policy = _policy_config.create_trained_policy(stage1_policy_config, args.init_checkpoint_dir)
     extract_features = nnx_utils.module_jit(policy.model.extract_rlt_features)
 
     # ── Load dataset ──────────────────────────────────────────────────────
@@ -321,7 +336,17 @@ def main(args: Args) -> None:
     replay = _replay_buffer.ReplayBuffer(
         args.replay_capacity, state_dim=state_dim, action_dim=action_dim
     )
-    policy_state = _trainer.init_policy_state(policy.model, args.actor_lr)
+    rng, actor_rng = jax.random.split(rng)
+    actor_model, actor_state = _trainer.init_actor_state(
+        actor_rng,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        hidden_dim=train_config.model.rlt_actor_hidden_dim,
+        learning_rate=args.actor_lr,
+    )
+    # Stage 2 starts from a freshly initialized RL actor. We intentionally do not
+    # copy the Stage 1 actor params here because those checkpoints predate the
+    # small-weight / zero-bias output-head init and would overwrite it.
     critic_model, critic_state = _trainer.init_critic_state(
         rng,
         state_dim=state_dim,
@@ -335,8 +360,8 @@ def main(args: Args) -> None:
         last_step = _checkpointing.latest_step(checkpoint_root)
         if last_step is not None:
             step_dir = checkpoint_root / str(last_step)
-            policy_state = _trainer.restore_policy_state(
-                policy.model,
+            actor_state = _trainer.restore_actor_state(
+                actor_model,
                 _checkpointing.restore_bundle(step_dir, "policy_state"),
                 args.actor_lr,
             )
@@ -402,7 +427,7 @@ def main(args: Args) -> None:
                 action_1step = ref.reshape(action_horizon, env_action_dim)[0].copy()
             else:
                 rng, actor_rng = jax.random.split(rng)
-                full_action = _actor_action(policy_state, actor_rng, state, ref)
+                full_action = _actor_action(actor_model, actor_state, actor_rng, state, ref)
                 action_1step = full_action.reshape(action_horizon, env_action_dim)[0]
             action_history[current_step] = action_1step
 
@@ -452,10 +477,11 @@ def main(args: Args) -> None:
                 for _ in range(args.utd_ratio):
                     batch = _to_jax_batch(replay.sample(args.batch_size, rng=np_rng))
                     rng, critic_rng = jax.random.split(rng)
-                    critic_state, critic_info = _trainer.critic_step(
+                    critic_state, critic_info = _trainer.critic_step_with_actor(
+                        actor_model,
+                        actor_state,
                         critic_model,
                         critic_state,
-                        policy_state,
                         batch,
                         critic_rng,
                         args.online,
@@ -465,10 +491,11 @@ def main(args: Args) -> None:
                     )
                     if critic_state.step % args.online.actor_update_interval == 0:
                         rng, actor_rng = jax.random.split(rng)
-                        policy_state, actor_info = _trainer.actor_step(
+                        actor_state, actor_info = _trainer.actor_step_with_actor(
+                            actor_model,
                             critic_model,
                             critic_state,
-                            policy_state,
+                            actor_state,
                             batch,
                             actor_rng,
                             args.online,
@@ -500,7 +527,7 @@ def main(args: Args) -> None:
                 _checkpointing.save_checkpoint(
                     checkpoint_root,
                     current_step,
-                    policy_state=_trainer.bundle_policy_state(policy_state),
+                    policy_state=_trainer.bundle_actor_train_state(actor_state),
                     critic_state=_trainer.bundle_critic_state(critic_state),
                     norm_stats=None,
                     asset_id=None,
@@ -510,7 +537,7 @@ def main(args: Args) -> None:
     _checkpointing.save_checkpoint(
         checkpoint_root,
         max(current_step - 1, 0),
-        policy_state=_trainer.bundle_policy_state(policy_state),
+        policy_state=_trainer.bundle_actor_train_state(actor_state),
         critic_state=_trainer.bundle_critic_state(critic_state),
         norm_stats=None,
         asset_id=None,

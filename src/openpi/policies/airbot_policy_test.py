@@ -12,15 +12,17 @@ def test_airbot_inputs_outputs_round_trip():
     example["actions"] = np.ones((10, 14), dtype=np.float32)
 
     inputs = transform(example)
-    assert inputs["state"].shape == (32,)
-    assert inputs["actions"].shape == (10, 32)
+    assert inputs["state"].shape == (14,)
+    assert inputs["proprio"].shape == (28,)
+    assert inputs["actions"].shape == (10, 14)
     assert inputs["image"]["base_0_rgb"].shape == (224, 224, 3)
     assert inputs["image_mask"]["base_0_rgb"]
     assert isinstance(inputs["prompt"], str)
 
-    outputs = airbot_policy.AirbotOutputs()({"actions": inputs["actions"]})
+    outputs = airbot_policy.AirbotOutputs()({"actions": np.pad(inputs["actions"], ((0, 0), (0, 18)))})
     assert outputs["actions"].shape == (10, 14)
-    np.testing.assert_allclose(inputs["state"][:28], example["proprio"])
+    np.testing.assert_allclose(inputs["state"], example["state"])
+    np.testing.assert_allclose(inputs["proprio"], example["proprio"])
     np.testing.assert_allclose(inputs["prompt_state"], example["state"])
 
 
@@ -38,7 +40,7 @@ def test_airbot_inputs_handles_missing_images():
     assert not inputs["image_mask"]["base_0_rgb"]
     assert not inputs["image_mask"]["left_wrist_0_rgb"]
     assert not inputs["image_mask"]["right_wrist_0_rgb"]
-    np.testing.assert_allclose(inputs["state"][:14], np.ones((14,), dtype=np.float32))
+    np.testing.assert_allclose(inputs["state"], np.ones((14,), dtype=np.float32))
     np.testing.assert_allclose(inputs["prompt_state"], np.ones((14,), dtype=np.float32))
 
 
@@ -61,6 +63,7 @@ def test_policy_prepare_observation_for_airbot():
         use_rlt=True,
         action_dim=32,
         action_horizon=10,
+        rlt_proprio_dim=28,
         paligemma_variant="dummy",
         action_expert_variant="dummy",
     )
@@ -71,6 +74,8 @@ def test_policy_prepare_observation_for_airbot():
     )
 
     inputs, observation = policy.prepare_observation(airbot_policy.make_airbot_example())
-    assert inputs["state"].shape == (32,)
-    assert observation.state.shape == (1, 32)
+    assert inputs["state"].shape == (14,)
+    assert inputs["proprio"].shape == (28,)
+    assert observation.state.shape == (1, 14)
+    assert observation.proprio.shape == (1, 28)
     assert observation.images["base_0_rgb"].shape == (1, 224, 224, 3)

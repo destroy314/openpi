@@ -66,8 +66,8 @@ class Args:
     """Control frequency sent to AirbotRLTEnvConfig (ignored with --config-path)."""
     left_follower_port: int = 50051
     right_follower_port: int = 50053
-    cam_high: int = 6
-    cam_left_wrist: int = 3
+    cam_high: int = 4
+    cam_left_wrist: int = 2
     cam_right_wrist: int = 0
     display_images: bool = True
 

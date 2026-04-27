@@ -178,7 +178,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
                 "Normalization stats not found. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
-        norm_stats = data_config.norm_stats
+        norm_stats = _config.get_input_norm_stats(data_config) or {}
 
     return TransformedDataset(
         dataset,
@@ -206,7 +206,7 @@ def transform_iterable_dataset(
                 "Normalization stats not found. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
-        norm_stats = data_config.norm_stats
+        norm_stats = _config.get_input_norm_stats(data_config) or {}
 
     return IterableTransformedDataset(
         dataset,
