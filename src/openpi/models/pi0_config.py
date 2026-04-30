@@ -43,7 +43,6 @@ class Pi0Config(_model.BaseModelConfig):
     rlt_env_action_dim: int | None = None
     rlt_proprio_dim: int | None = None
     rlt_actor_hidden_dim: int = 256
-    rlt_actor_std: float = 0.01
     rlt_reference_dropout: float = 0.5
 
     def __post_init__(self):

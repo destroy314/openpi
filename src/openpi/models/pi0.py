@@ -126,7 +126,6 @@ class Pi0(_model.BaseModel):
                     _rlt_actor_critic.GaussianActor(
                         action_dim=self.rlt_env_action_dim * self.rlt_action_horizon,
                         hidden_dim=config.rlt_actor_hidden_dim,
-                        init_std=config.rlt_actor_std,
                     )
                 )
                 rlt_actor.lazy_init(

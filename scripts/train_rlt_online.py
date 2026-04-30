@@ -95,7 +95,7 @@ class Args:
     overwrite: bool = False
     resume: bool = False
     seed: int = 0
-    record_repro: bool = False
+    record_repro: bool = True
     repro_shard_size: int = 64
 
     online: _trainer.OnlineRLTConfig = dataclasses.field(default_factory=_trainer.OnlineRLTConfig)
@@ -141,10 +141,20 @@ def _compute_reference_plan(
     *,
     diffusion_steps: int,
     env_action_dim: int,
+    norm_stats,
+    use_quantiles: bool,
+    use_delta_joint_actions: bool,
 ) -> np.ndarray:
     _, batched_observation = policy.prepare_observation(observation)
     reference_actions = sample_reference_actions(rng, batched_observation, num_steps=diffusion_steps)
-    return np.asarray(reference_actions[0, :, :env_action_dim], dtype=np.float32)
+    reference_actions = np.asarray(reference_actions[0, :, :env_action_dim], dtype=np.float32)
+    return _denormalize_action(
+        norm_stats,
+        use_quantiles,
+        reference_actions,
+        state=observation["state"],
+        use_delta_joint_actions=use_delta_joint_actions,
+    )
 
 
 def _resolve_reference_chunk(
@@ -362,6 +372,7 @@ def _record_action_history(
 def _flush_ready_chunks(
     pending_chunks: list[int],
     state_history: dict[int, np.ndarray],
+    action_base_state_history: dict[int, np.ndarray],
     reference_plan_history: dict[int, np.ndarray],
     action_history: dict[int, np.ndarray],
     intervention_history: dict[int, bool],
@@ -373,6 +384,9 @@ def _flush_ready_chunks(
     replan_origin_step: int,
     vla_replan_horizon: int,
     discount: float,
+    norm_stats,
+    use_quantiles: bool,
+    use_delta_joint_actions: bool,
     terminal: bool = False,
     terminal_state: np.ndarray | None = None,
 ) -> int:
@@ -388,43 +402,73 @@ def _flush_ready_chunks(
         bootstrap_steps = min(action_horizon, available_steps)
         discounted_reward = _discounted_return(reward_history, chunk_step, bootstrap_steps, discount)
         state = state_history[chunk_step]
-        reference_chunk = _resolve_reference_chunk(
+        base_action_state = action_base_state_history[chunk_step]
+        reference_chunk_real = _resolve_reference_chunk(
             reference_plan_history,
             step=chunk_step,
             action_horizon=action_horizon,
             replan_origin_step=replan_origin_step,
             vla_replan_horizon=vla_replan_horizon,
         ).reshape(action_horizon, -1)
-        action_chunk = reference_chunk.copy()
+        action_chunk_real = reference_chunk_real.copy()
         for offset in range(bootstrap_steps):
             step = chunk_step + offset
             executed_action = action_history[step]
-            action_chunk[offset] = executed_action
+            action_chunk_real[offset] = executed_action
             if intervention_history.get(step, False):
-                reference_chunk[offset] = executed_action
+                reference_chunk_real[offset] = executed_action
+
+        action_chunk = _normalize_action(
+            norm_stats,
+            use_quantiles,
+            action_chunk_real,
+            state=base_action_state,
+            use_delta_joint_actions=use_delta_joint_actions,
+        )
+        reference_chunk = _normalize_action(
+            norm_stats,
+            use_quantiles,
+            reference_chunk_real,
+            state=base_action_state,
+            use_delta_joint_actions=use_delta_joint_actions,
+        )
 
         if bootstrap_steps == action_horizon and not terminal:
             next_step = chunk_step + action_horizon
             next_state = state_history[next_step]
-            next_reference_action = _resolve_reference_chunk(
+            next_reference_action_real = _resolve_reference_chunk(
                 reference_plan_history,
                 step=next_step,
                 action_horizon=action_horizon,
                 replan_origin_step=replan_origin_step,
                 vla_replan_horizon=vla_replan_horizon,
             )
+            next_reference_action = _normalize_action(
+                norm_stats,
+                use_quantiles,
+                next_reference_action_real.reshape(action_horizon, -1),
+                state=action_base_state_history[next_step],
+                use_delta_joint_actions=use_delta_joint_actions,
+            ).reshape(-1)
             done = False
         else:
             if terminal_state is None:
                 raise ValueError("terminal_state is required when flushing truncated chunk transitions.")
             next_state = terminal_state
-            next_reference_action = _resolve_reference_chunk(
+            next_reference_action_real = _resolve_reference_chunk(
                 reference_plan_history,
                 step=current_step,
                 action_horizon=action_horizon,
                 replan_origin_step=replan_origin_step,
                 vla_replan_horizon=vla_replan_horizon,
             )
+            next_reference_action = _normalize_action(
+                norm_stats,
+                use_quantiles,
+                next_reference_action_real.reshape(action_horizon, -1),
+                state=action_base_state_history[current_step],
+                use_delta_joint_actions=use_delta_joint_actions,
+            ).reshape(-1)
             done = True
 
         transition_sink(
@@ -788,6 +832,7 @@ def main(args: Args) -> None:
         if data_config.asset_id is not None
         else None
     )
+    use_delta_joint_actions = any(isinstance(t, _transforms.DeltaActions) for t in data_config.data_transforms.inputs)
 
     env_config = _airbot_env.AirbotRLTEnvConfig.from_env()
     env = _airbot_env.AirbotRLTEnv(env_config)
@@ -808,14 +853,24 @@ def main(args: Args) -> None:
         initial_observation,
         diffusion_steps=args.diffusion_steps,
         env_action_dim=online_env_action_dim,
+        norm_stats=norm_stats,
+        use_quantiles=data_config.use_quantile_norm,
+        use_delta_joint_actions=use_delta_joint_actions,
     )
-    initial_reference = _resolve_reference_chunk(
+    initial_reference_real = _resolve_reference_chunk(
         {0: initial_reference_plan},
         step=0,
         action_horizon=online_action_horizon,
         replan_origin_step=0,
         vla_replan_horizon=vla_replan_horizon,
     )
+    initial_reference = _normalize_action(
+        norm_stats,
+        data_config.use_quantile_norm,
+        initial_reference_real.reshape(online_action_horizon, online_env_action_dim),
+        state=initial_observation["state"],
+        use_delta_joint_actions=use_delta_joint_actions,
+    ).reshape(-1)
     state_dim = int(initial_state.shape[-1])
     action_dim = int(initial_reference.shape[-1])
     rng, actor_rng = jax.random.split(rng)
@@ -889,6 +944,11 @@ def main(args: Args) -> None:
     reward_history: list[float] = [0.0] * start_step
     current_step = start_step
     state_history: dict[int, np.ndarray] = {current_step: initial_state} if current_step == 0 else {}
+    action_base_state_history: dict[int, np.ndarray] = (
+        {current_step: _action_transform_state(initial_observation["state"], online_env_action_dim)}
+        if current_step == 0
+        else {}
+    )
     reference_plan_history: dict[int, np.ndarray] = {current_step: initial_reference_plan} if current_step == 0 else {}
     action_history: dict[int, np.ndarray] = {}
     intervention_history: dict[int, bool] = {}
@@ -912,6 +972,10 @@ def main(args: Args) -> None:
                 )
                 state_history[current_step] = state
                 pending_chunks.append(current_step)
+            action_base_state_history.setdefault(
+                current_step,
+                _action_transform_state(observation["state"], online_env_action_dim),
+            )
 
             if (current_step - replan_origin_step) % vla_replan_horizon == 0 and current_step not in reference_plan_history:
                 rng, plan_rng = jax.random.split(rng)
@@ -922,15 +986,25 @@ def main(args: Args) -> None:
                     observation,
                     diffusion_steps=args.diffusion_steps,
                     env_action_dim=online_env_action_dim,
+                    norm_stats=norm_stats,
+                    use_quantiles=data_config.use_quantile_norm,
+                    use_delta_joint_actions=use_delta_joint_actions,
                 )
 
-            reference_action = _resolve_reference_chunk(
+            reference_action_real = _resolve_reference_chunk(
                 reference_plan_history,
                 step=current_step,
                 action_horizon=online_action_horizon,
                 replan_origin_step=replan_origin_step,
                 vla_replan_horizon=vla_replan_horizon,
             )
+            reference_action = _normalize_action(
+                norm_stats,
+                data_config.use_quantile_norm,
+                reference_action_real.reshape(online_action_horizon, online_env_action_dim),
+                state=observation["state"],
+                use_delta_joint_actions=use_delta_joint_actions,
+            ).reshape(-1)
 
             if current_step < args.warmup_steps:
                 action = reference_action
@@ -945,25 +1019,18 @@ def main(args: Args) -> None:
                 data_config.use_quantile_norm,
                 action_chunk_norm,
                 state=observation["state"],
-                use_delta_joint_actions=data_config.use_delta_joint_actions,
+                use_delta_joint_actions=use_delta_joint_actions,
             )
             next_observation, reward, done, info = env.step(action_chunk_real)
             step_rewards = _extract_step_rewards(reward, info, online_action_horizon)
-            # executed_actions returned by env are in real joint-position space; convert them back into
-            # the same model space as reference_action before storing them in replay.
+            # Keep executed action history in real joint-position space. Replay chunks are converted
+            # to model space later using each transition's own start state as the delta base.
             executed_actions_real = _extract_executed_actions(
                 info,
                 executed_steps=len(step_rewards),
                 fallback_actions=action_chunk_real,
             )
             intervened_mask = _extract_intervened_mask(info, executed_steps=len(step_rewards))
-            executed_actions_norm = _normalize_action(
-                norm_stats,
-                data_config.use_quantile_norm,
-                executed_actions_real,
-                state=observation["state"],
-                use_delta_joint_actions=data_config.use_delta_joint_actions,
-            )
             _log_collector_actions(
                 env_step=current_step,
                 learner_step=int(actor_state.step),
@@ -974,7 +1041,7 @@ def main(args: Args) -> None:
                 action_history,
                 intervention_history,
                 start_step=current_step,
-                executed_actions=executed_actions_norm,
+                executed_actions=executed_actions_real,
                 intervened_mask=intervened_mask,
             )
             reward_history.extend(step_rewards)
@@ -1009,6 +1076,10 @@ def main(args: Args) -> None:
                     compute_rl_token,
                     sample_observation,
                 )
+                action_base_state_history[sample_step] = _action_transform_state(
+                    sample_observation["state"],
+                    online_env_action_dim,
+                )
                 pending_chunks.append(sample_step)
                 if (sample_step - replan_origin_step) % vla_replan_horizon == 0:
                     rng, plan_rng = jax.random.split(rng)
@@ -1019,6 +1090,9 @@ def main(args: Args) -> None:
                         sample_observation,
                         diffusion_steps=args.diffusion_steps,
                         env_action_dim=online_env_action_dim,
+                        norm_stats=norm_stats,
+                        use_quantiles=data_config.use_quantile_norm,
+                        use_delta_joint_actions=use_delta_joint_actions,
                     )
 
             current_step += len(step_rewards)
@@ -1035,6 +1109,10 @@ def main(args: Args) -> None:
                         next_observation,
                     )
                     state_history[current_step] = terminal_state
+                action_base_state_history[current_step] = _action_transform_state(
+                    next_observation["state"],
+                    online_env_action_dim,
+                )
                 if (current_step - replan_origin_step) % vla_replan_horizon == 0 and current_step not in reference_plan_history:
                     rng, plan_rng = jax.random.split(rng)
                     reference_plan_history[current_step] = _compute_reference_plan(
@@ -1044,11 +1122,15 @@ def main(args: Args) -> None:
                         next_observation,
                         diffusion_steps=args.diffusion_steps,
                         env_action_dim=online_env_action_dim,
+                        norm_stats=norm_stats,
+                        use_quantiles=data_config.use_quantile_norm,
+                        use_delta_joint_actions=use_delta_joint_actions,
                     )
 
             _flush_ready_chunks(
                 pending_chunks,
                 state_history,
+                action_base_state_history,
                 reference_plan_history,
                 action_history,
                 intervention_history,
@@ -1059,6 +1141,9 @@ def main(args: Args) -> None:
                 replan_origin_step=replan_origin_step,
                 vla_replan_horizon=vla_replan_horizon,
                 discount=args.online.discount,
+                norm_stats=norm_stats,
+                use_quantiles=data_config.use_quantile_norm,
+                use_delta_joint_actions=use_delta_joint_actions,
                 terminal=done,
                 terminal_state=terminal_state,
             )
@@ -1087,6 +1172,7 @@ def main(args: Args) -> None:
                 action_history.clear()
                 intervention_history.clear()
                 state_history.clear()
+                action_base_state_history.clear()
                 reference_plan_history.clear()
                 pending_chunks.clear()
                 replan_origin_step = current_step
@@ -1101,6 +1187,10 @@ def main(args: Args) -> None:
                 observation,
             )
             state_history[current_step] = final_state
+            action_base_state_history[current_step] = _action_transform_state(
+                observation["state"],
+                online_env_action_dim,
+            )
             if (current_step - replan_origin_step) % vla_replan_horizon == 0 and current_step not in reference_plan_history:
                 rng, plan_rng = jax.random.split(rng)
                 reference_plan_history[current_step] = _compute_reference_plan(
@@ -1110,10 +1200,14 @@ def main(args: Args) -> None:
                     observation,
                     diffusion_steps=args.diffusion_steps,
                     env_action_dim=online_env_action_dim,
+                    norm_stats=norm_stats,
+                    use_quantiles=data_config.use_quantile_norm,
+                    use_delta_joint_actions=use_delta_joint_actions,
                 )
             _flush_ready_chunks(
                 pending_chunks,
                 state_history,
+                action_base_state_history,
                 reference_plan_history,
                 action_history,
                 intervention_history,
@@ -1124,10 +1218,14 @@ def main(args: Args) -> None:
                 replan_origin_step=replan_origin_step,
                 vla_replan_horizon=vla_replan_horizon,
                 discount=args.online.discount,
+                norm_stats=norm_stats,
+                use_quantiles=data_config.use_quantile_norm,
+                use_delta_joint_actions=use_delta_joint_actions,
             )
             _flush_ready_chunks(
                 pending_chunks,
                 state_history,
+                action_base_state_history,
                 reference_plan_history,
                 action_history,
                 intervention_history,
@@ -1138,6 +1236,9 @@ def main(args: Args) -> None:
                 replan_origin_step=replan_origin_step,
                 vla_replan_horizon=vla_replan_horizon,
                 discount=args.online.discount,
+                norm_stats=norm_stats,
+                use_quantiles=data_config.use_quantile_norm,
+                use_delta_joint_actions=use_delta_joint_actions,
                 terminal=True,
                 terminal_state=final_state,
             )

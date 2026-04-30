@@ -14,6 +14,7 @@ from openpi.rlt import checkpointing
 from openpi.rlt import replay_buffer
 from openpi.rlt import token_module
 from openpi.rlt import trainer
+from openpi.shared.normalize import NormStats
 
 
 def _make_transition_batch(batch: replay_buffer.TransitionBatch) -> replay_buffer.TransitionBatch:
@@ -224,6 +225,69 @@ def test_resolve_reference_chunk_raises_when_chunk_would_cross_plan_end():
             replan_origin_step=0,
             vla_replan_horizon=6,
         )
+
+
+def test_flush_ready_chunks_normalizes_intermediate_chunk_against_its_own_state():
+    captured = []
+    action_horizon = 4
+    env_action_dim = 14
+    norm_stats = {
+        "actions": NormStats(
+            mean=np.zeros((env_action_dim,), dtype=np.float32),
+            std=np.ones((env_action_dim,), dtype=np.float32),
+        )
+    }
+    reference_plan = np.tile(
+        (100.0 + np.arange(10, dtype=np.float32))[:, None],
+        (1, env_action_dim),
+    )
+    action_history = {
+        step: np.full((env_action_dim,), 18.0 + step, dtype=np.float32)
+        for step in range(2, 6)
+    }
+
+    online._flush_ready_chunks(
+        pending_chunks=[2],
+        state_history={
+            2: np.full((3,), 2.0, dtype=np.float32),
+            6: np.full((3,), 6.0, dtype=np.float32),
+        },
+        action_base_state_history={
+            2: np.full((env_action_dim,), 10.0, dtype=np.float32),
+            6: np.full((env_action_dim,), 60.0, dtype=np.float32),
+        },
+        reference_plan_history={0: reference_plan},
+        action_history=action_history,
+        intervention_history={},
+        reward_history=[1.0] * 6,
+        transition_sink=captured.append,
+        current_step=6,
+        action_horizon=action_horizon,
+        replan_origin_step=0,
+        vla_replan_horizon=6,
+        discount=1.0,
+        norm_stats=norm_stats,
+        use_quantiles=False,
+        use_delta_joint_actions=True,
+    )
+
+    assert len(captured) == 1
+    transition = captured[0]
+    np.testing.assert_allclose(
+        transition.action.reshape(action_horizon, env_action_dim)[:, 0],
+        [10.0, 11.0, 12.0, 13.0],
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        transition.reference_action.reshape(action_horizon, env_action_dim)[:, 0],
+        [92.0, 93.0, 94.0, 95.0],
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        transition.next_reference_action.reshape(action_horizon, env_action_dim)[:, 0],
+        [46.0, 47.0, 48.0, 49.0],
+        rtol=1e-5,
+    )
 
 
 def test_queue_transition_records_before_enqueue():
