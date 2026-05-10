@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import multiprocessing as mp
 import os
 import pathlib
 import queue
 import signal
-import traceback
 from typing import Any, Callable
 
 import flax.nnx as nnx
@@ -18,14 +16,21 @@ import tyro
 
 from openpi import transforms as _transforms
 from openpi.policies import policy_config as _policy_config
+from openpi.rlt import action_space as _action_space
 from openpi.rlt import airbot_env as _airbot_env
 from openpi.rlt import checkpointing as _checkpointing
-from openpi.rlt import replay_buffer as _replay_buffer
 from openpi.rlt import repro as _repro
+from openpi.rlt.rtvla_contract import LearnerError
+from openpi.rlt.rtvla_contract import LearnerInit
+from openpi.rlt.rtvla_contract import PolicyUpdate
+from openpi.rlt.rtvla_contract import ReplayItem
+from openpi.rlt.rtvla_contract import StopSignal
 from openpi.rlt import trainer as _trainer
 from openpi.shared import nnx_utils
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
+from rt_vla.client import learner_runtime as _learner_runtime
+from rt_vla.client import rlt_learner as _rlt_learner
 
 
 @dataclasses.dataclass
@@ -34,41 +39,6 @@ class PlannedChunk:
     state: np.ndarray
     action: np.ndarray
     reference_action: np.ndarray
-
-
-@dataclasses.dataclass
-class ReplayItem:
-    state: np.ndarray
-    action: np.ndarray
-    reference_action: np.ndarray
-    reward: float
-    next_state: np.ndarray
-    next_reference_action: np.ndarray
-    bootstrap_steps: int
-    done: bool
-    env_step: int
-
-
-@dataclasses.dataclass(frozen=True)
-class StopSignal:
-    final_step: int
-
-
-@dataclasses.dataclass
-class LearnerInit:
-    start_step: int
-    actor_params: dict[str, Any]
-
-
-@dataclasses.dataclass
-class PolicyUpdate:
-    actor_params: dict[str, Any]
-
-
-@dataclasses.dataclass
-class LearnerError:
-    message: str
-    traceback: str
 
 
 @dataclasses.dataclass
@@ -101,18 +71,69 @@ class Args:
     online: _trainer.OnlineRLTConfig = dataclasses.field(default_factory=_trainer.OnlineRLTConfig)
 
 
-def _to_jax_batch(batch: _replay_buffer.TransitionBatch) -> _replay_buffer.TransitionBatch:
-    return _replay_buffer.TransitionBatch(
-        state=jnp.asarray(batch.state),
-        action=jnp.asarray(batch.action),
-        reference_action=jnp.asarray(batch.reference_action),
-        reward=jnp.asarray(batch.reward),
-        next_state=jnp.asarray(batch.next_state),
-        next_reference_action=jnp.asarray(batch.next_reference_action),
-        bootstrap_steps=jnp.asarray(batch.bootstrap_steps),
-        done=jnp.asarray(batch.done),
-    )
+def _to_jax_batch(batch):
+    return _rlt_learner._to_jax_batch(batch)
 
+
+def _publish_policy_update(policy_queue, policy_state) -> None:
+    _learner_runtime.publish_policy_update(policy_queue, _trainer.bundle_actor_params(policy_state))
+
+
+def _drain_policy_updates(policy_queue, policy_state, *, sync_logger: logging.Logger | None = None):
+    latest: PolicyUpdate | None = None
+    while True:
+        try:
+            message = policy_queue.get_nowait()
+        except queue.Empty:
+            break
+        if isinstance(message, PolicyUpdate):
+            latest = message
+    if latest is None:
+        return policy_state
+    if sync_logger is not None:
+        sync_logger.info("received_actor_step=%d", int(latest.actor_params["step"]))
+    return _trainer.apply_actor_params(policy_state, latest.actor_params)
+
+
+def _check_learner_status(status_queue) -> None:
+    while True:
+        try:
+            message = status_queue.get_nowait()
+        except queue.Empty:
+            return
+        if isinstance(message, LearnerError):
+            raise RuntimeError(f"Learner process failed: {message.message}\n{message.traceback}")
+
+
+def _wait_for_learner_init(status_queue) -> LearnerInit:
+    while True:
+        message = status_queue.get()
+        if isinstance(message, LearnerInit):
+            return message
+        if isinstance(message, LearnerError):
+            raise RuntimeError(f"Learner process failed: {message.message}\n{message.traceback}")
+
+
+def _learner_main(
+    args: Args,
+    checkpoint_root: pathlib.Path,
+    state_dim: int,
+    action_dim: int,
+    actor_hidden_dim: int,
+    sample_queue,
+    policy_queue,
+    status_queue,
+) -> None:
+    _rlt_learner.run_online_rlt_learner(
+        _build_online_learner_config(args),
+        checkpoint_root,
+        state_dim,
+        action_dim,
+        actor_hidden_dim,
+        sample_queue,
+        policy_queue,
+        status_queue,
+    )
 
 def _compute_rlt_state(
     policy,
@@ -190,68 +211,11 @@ def _resolve_reference_chunk(
     return np.asarray(plan[plan_offset:end], dtype=np.float32).reshape(-1)
 
 
-def _slice_norm_stats(stats, dim: int):
-    """Truncate a NormStats to the first `dim` elements along the last axis."""
-    from openpi.shared.normalize import NormStats
-    return NormStats(
-        mean=stats.mean[..., :dim],
-        std=stats.std[..., :dim],
-        q01=stats.q01[..., :dim] if stats.q01 is not None else None,
-        q99=stats.q99[..., :dim] if stats.q99 is not None else None,
-    )
-
-
-def _airbot_delta_action_mask() -> tuple[bool, ...]:
-    return _transforms.make_bool_mask(6, -1, 6, -1)
-
-
-def _action_transform_state(state: np.ndarray, env_dim: int) -> np.ndarray:
-    state = np.asarray(state, dtype=np.float32).reshape(-1)
-    if state.shape[-1] < env_dim:
-        raise ValueError(f"state must have at least {env_dim} dims, got {state.shape[-1]}")
-    return state[:env_dim].copy()
-
-
-def _denormalize_action(
-    norm_stats,
-    use_quantiles: bool,
-    actions: np.ndarray,
-    *,
-    state: np.ndarray | None = None,
-    use_delta_joint_actions: bool = False,
-) -> np.ndarray:
-    """Convert a (steps, env_action_dim) action from model space to real joint-position space."""
-    outputs = {"actions": np.asarray(actions, dtype=np.float32).copy()}
-    env_dim = outputs["actions"].shape[-1]
-    action_stats = {"actions": _slice_norm_stats(norm_stats["actions"], env_dim)}
-    outputs = _transforms.Unnormalize(action_stats, use_quantiles=use_quantiles)(outputs)
-    if use_delta_joint_actions:
-        if state is None:
-            raise ValueError("state is required to convert delta actions back to absolute actions.")
-        outputs["state"] = _action_transform_state(state, env_dim)
-        outputs = _transforms.AbsoluteActions(_airbot_delta_action_mask())(outputs)
-    return np.asarray(outputs["actions"], dtype=np.float32)
-
-
-def _normalize_action(
-    norm_stats,
-    use_quantiles: bool,
-    actions: np.ndarray,
-    *,
-    state: np.ndarray | None = None,
-    use_delta_joint_actions: bool = False,
-) -> np.ndarray:
-    """Convert a (steps, env_action_dim) action from real joint-position space back to model space."""
-    outputs = {"actions": np.asarray(actions, dtype=np.float32).copy()}
-    env_dim = outputs["actions"].shape[-1]
-    if use_delta_joint_actions:
-        if state is None:
-            raise ValueError("state is required to convert absolute actions into delta actions.")
-        outputs["state"] = _action_transform_state(state, env_dim)
-        outputs = _transforms.DeltaActions(_airbot_delta_action_mask())(outputs)
-    action_stats = {"actions": _slice_norm_stats(norm_stats["actions"], env_dim)}
-    outputs = _transforms.Normalize(action_stats, use_quantiles=use_quantiles)(outputs)
-    return np.asarray(outputs["actions"], dtype=np.float32)
+_slice_norm_stats = _action_space._slice_norm_stats
+_airbot_delta_action_mask = _action_space._airbot_delta_action_mask
+_action_transform_state = _action_space._action_transform_state
+_denormalize_action = _action_space._denormalize_action
+_normalize_action = _action_space._normalize_action
 
 
 def _actor_action(actor_model, actor_state, rng: jax.Array, state: np.ndarray, reference_action: np.ndarray) -> np.ndarray:
@@ -490,43 +454,17 @@ def _flush_ready_chunks(
 
 
 def _queue_transition(
-    sample_queue: mp.queues.Queue,
+    learner_runtime: _learner_runtime.LearnerProcessHandle | Any,
     item: ReplayItem,
     *,
     transition_recorder: _repro.TransitionRecorder | None = None,
 ) -> None:
     if transition_recorder is not None:
         transition_recorder.add(item)
-    sample_queue.put(item)
-
-
-def _publish_policy_update(policy_queue: mp.queues.Queue, policy_state) -> None:
-    update = PolicyUpdate(actor_params=_trainer.bundle_actor_params(policy_state))
-    while True:
-        try:
-            policy_queue.put_nowait(update)
-            return
-        except queue.Full:
-            try:
-                policy_queue.get_nowait()
-            except queue.Empty:
-                continue
-
-
-def _drain_policy_updates(policy_queue: mp.queues.Queue, policy_state, *, sync_logger: logging.Logger | None = None):
-    latest: PolicyUpdate | None = None
-    while True:
-        try:
-            message = policy_queue.get_nowait()
-        except queue.Empty:
-            break
-        if isinstance(message, PolicyUpdate):
-            latest = message
-    if latest is None:
-        return policy_state
-    if sync_logger is not None:
-        sync_logger.info("received_actor_step=%d", int(latest.actor_params["step"]))
-    return _trainer.apply_actor_params(policy_state, latest.actor_params)
+    if hasattr(learner_runtime, "queue_sample"):
+        learner_runtime.queue_sample(item)
+        return
+    learner_runtime.put(item)
 
 
 def _log_collector_actions(
@@ -562,205 +500,23 @@ def _log_collector_actions(
     )
 
 
-def _check_learner_status(status_queue: mp.queues.Queue) -> None:
-    while True:
-        try:
-            message = status_queue.get_nowait()
-        except queue.Empty:
-            return
-        if isinstance(message, LearnerError):
-            raise RuntimeError(f"Learner process failed: {message.message}\n{message.traceback}")
-
-
-def _shutdown_learner(
-    learner_process: mp.Process,
-    sample_queue: mp.queues.Queue,
-    *,
-    final_step: int,
-    graceful_stop_sent: bool,
-    join_timeout_s: float = 60.0,
-) -> bool:
-    if learner_process.pid is None:
-        return graceful_stop_sent
-    if learner_process.is_alive() and not graceful_stop_sent:
-        sample_queue.put(StopSignal(final_step=max(final_step, 0)))
-        graceful_stop_sent = True
-    learner_process.join(timeout=join_timeout_s)
-    if learner_process.is_alive():
-        learner_process.terminate()
-        learner_process.join(timeout=join_timeout_s)
-    return graceful_stop_sent
-
-
-def _wait_for_learner_init(status_queue: mp.queues.Queue) -> LearnerInit:
-    while True:
-        message = status_queue.get()
-        if isinstance(message, LearnerInit):
-            return message
-        if isinstance(message, LearnerError):
-            raise RuntimeError(f"Learner process failed: {message.message}\n{message.traceback}")
-
-
-def _learner_main(
-    args: Args,
-    checkpoint_root: pathlib.Path,
-    state_dim: int,
-    action_dim: int,
-    actor_hidden_dim: int,
-    sample_queue: mp.queues.Queue,
-    policy_queue: mp.queues.Queue,
-    status_queue: mp.queues.Queue,
-) -> None:
-    try:
-        logging.basicConfig(level=logging.INFO, force=True)
-        # Let the collector process own Ctrl-C handling so it can enqueue StopSignal
-        # and give the learner a chance to flush replay artifacts before exit.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        _trainer.set_actor_sample_debug(True, log_path=checkpoint_root / "actor_sample.log")
-
-        train_config = _config.get_config(args.config)
-        data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
-        norm_stats = (
-            _checkpoints.load_norm_stats(args.init_checkpoint_dir / "assets", data_config.asset_id)
-            if data_config.asset_id is not None
-            else None
-        )
-
-        rng = jax.random.key(args.seed)
-        replay = _replay_buffer.ReplayBuffer(args.replay_capacity, state_dim=state_dim, action_dim=action_dim)
-        rng, actor_rng = jax.random.split(rng)
-        # Stage 2 must start from the new RL actor initialization rather than the
-        # Stage 1 actor weights. The small-output-head init was added after the
-        # existing Stage 1 checkpoints were trained, so reusing those actor params
-        # would silently discard the intended initialization.
-        actor_model, actor_state = _trainer.init_actor_state(
-            actor_rng,
-            state_dim=state_dim,
-            action_dim=action_dim,
-            hidden_dim=actor_hidden_dim,
-            learning_rate=args.actor_lr,
-        )
-        critic_model, critic_state = _trainer.init_critic_state(
-            rng,
-            state_dim=state_dim,
-            action_dim=action_dim,
-            hidden_dim=train_config.model.rlt_actor_hidden_dim,
-            learning_rate=args.critic_lr,
-        )
-
-        start_step = 0
-        last_saved_step = -1
-        if args.resume:
-            last_step = _checkpointing.latest_step(checkpoint_root)
-            if last_step is not None:
-                step_dir = checkpoint_root / str(last_step)
-                actor_state = _trainer.restore_actor_state(
-                    actor_model,
-                    _checkpointing.restore_bundle(step_dir, "policy_state"),
-                    args.actor_lr,
-                )
-                critic_state = _trainer.restore_critic_state(
-                    critic_model,
-                    _checkpointing.restore_bundle(step_dir, "critic_state"),
-                    args.critic_lr,
-                )
-                start_step = last_step + 1
-                last_saved_step = last_step
-                logging.info("Resumed online RLT state from %s", step_dir)
-
-        if args.record_repro:
-            repro_dir = checkpoint_root / "repro"
-            _repro.save_initial_state(repro_dir, "policy_state", _trainer.bundle_actor_train_state(actor_state))
-            _repro.save_initial_state(repro_dir, "critic_state", _trainer.bundle_critic_state(critic_state))
-
-        status_queue.put(LearnerInit(start_step=start_step, actor_params=_trainer.bundle_actor_params(actor_state)))
-
-        np_rng = np.random.default_rng(args.seed)
-        metrics: list[dict[str, float]] = []
-        latest_env_step = start_step
-
-        while True:
-            message = sample_queue.get()
-            if isinstance(message, StopSignal):
-                final_step = max(message.final_step, 0)
-                _checkpointing.save_checkpoint(
-                    checkpoint_root,
-                    final_step,
-                    policy_state=_trainer.bundle_actor_train_state(actor_state),
-                    critic_state=_trainer.bundle_critic_state(critic_state),
-                    norm_stats=norm_stats,
-                    asset_id=data_config.asset_id,
-                )
-                return
-
-            if not isinstance(message, ReplayItem):
-                raise TypeError(f"Unsupported learner message: {type(message)!r}")
-
-            replay.add(
-                state=message.state,
-                action=message.action,
-                reference_action=message.reference_action,
-                reward=message.reward,
-                next_state=message.next_state,
-                next_reference_action=message.next_reference_action,
-                bootstrap_steps=message.bootstrap_steps,
-                done=message.done,
-            )
-            latest_env_step = max(latest_env_step, message.env_step)
-
-            if len(replay) >= args.batch_size and latest_env_step >= args.warmup_steps:
-                for _ in range(args.utd_ratio):
-                    batch = _to_jax_batch(replay.sample(args.batch_size, rng=np_rng))
-                    rng, critic_rng = jax.random.split(rng)
-                    critic_state, critic_info = _trainer.critic_step_with_actor(
-                        actor_model,
-                        actor_state,
-                        critic_model,
-                        critic_state,
-                        batch,
-                        critic_rng,
-                        args.online,
-                    )
-                    metrics.append({k: float(np.asarray(v)) for k, v in critic_info.items()})
-                    if critic_state.step % args.online.actor_update_interval == 0:
-                        rng, actor_rng = jax.random.split(rng)
-                        actor_state, actor_info = _trainer.actor_step_with_actor(
-                            actor_model,
-                            critic_model,
-                            critic_state,
-                            actor_state,
-                            batch,
-                            actor_rng,
-                            args.online,
-                        )
-                        metrics.append({k: float(np.asarray(v)) for k, v in actor_info.items()})
-                        _publish_policy_update(policy_queue, actor_state)
-
-            if latest_env_step % args.log_interval == 0 and metrics:
-                reduced = {
-                    key: float(np.mean([entry[key] for entry in metrics if key in entry]))
-                    for key in sorted({key for entry in metrics for key in entry})
-                }
-                logging.info("Learner step %d: %s", latest_env_step, ", ".join(f"{k}={v:.4f}" for k, v in reduced.items()))
-                metrics.clear()
-
-            if (
-                latest_env_step % args.save_interval == 0
-                and latest_env_step > start_step
-                and latest_env_step != last_saved_step
-            ):
-                _checkpointing.save_checkpoint(
-                    checkpoint_root,
-                    latest_env_step,
-                    policy_state=_trainer.bundle_actor_train_state(actor_state),
-                    critic_state=_trainer.bundle_critic_state(critic_state),
-                    norm_stats=norm_stats,
-                    asset_id=data_config.asset_id,
-                )
-                last_saved_step = latest_env_step
-    except Exception as exc:  # pragma: no cover - best effort propagation across processes.
-        status_queue.put(LearnerError(message=str(exc), traceback=traceback.format_exc()))
-        raise
+def _build_online_learner_config(args: Args) -> _rlt_learner.OnlineRLTLearnerConfig:
+    return _rlt_learner.OnlineRLTLearnerConfig(
+        config=args.config,
+        init_checkpoint_dir=args.init_checkpoint_dir,
+        replay_capacity=args.replay_capacity,
+        batch_size=args.batch_size,
+        utd_ratio=args.utd_ratio,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
+        save_interval=args.save_interval,
+        log_interval=args.log_interval,
+        warmup_steps=args.warmup_steps,
+        resume=args.resume,
+        seed=args.seed,
+        record_repro=args.record_repro,
+        online=args.online,
+    )
 
 
 def main(args: Args) -> None:
@@ -909,27 +665,23 @@ def main(args: Args) -> None:
         _repro.save_resolved_env_config(repro_dir, env_config)
         _repro.save_norm_stats_snapshot(repro_dir, norm_stats, data_config.asset_id)
 
-    mp_context = mp.get_context("spawn")
-    sample_queue = mp_context.Queue(maxsize=max(args.batch_size * args.utd_ratio, 1024))
-    policy_queue = mp_context.Queue(maxsize=1)
-    status_queue = mp_context.Queue()
-    learner_process = mp_context.Process(
-        target=_learner_main,
-        args=(
-            args,
+    learner_runtime = _learner_runtime.LearnerProcessHandle.spawn(
+        target=_rlt_learner.run_online_rlt_learner,
+        target_args=(
+            _build_online_learner_config(args),
             checkpoint_root,
             state_dim,
             action_dim,
             actor_hidden_dim,
-            sample_queue,
-            policy_queue,
-            status_queue,
         ),
-        name="rlt-learner",
+        config=_learner_runtime.LearnerProcessConfig(
+            sample_queue_size=max(args.batch_size * args.utd_ratio, 1024),
+            policy_queue_size=1,
+            process_name="rlt-learner",
+        ),
     )
-    learner_process.start()
 
-    init_message = _wait_for_learner_init(status_queue)
+    init_message = learner_runtime.wait_for_init()
     start_step = init_message.start_step
     if args.record_repro:
         manifest = _repro.load_manifest(repro_dir)
@@ -937,7 +689,7 @@ def main(args: Args) -> None:
         _repro.write_manifest(repro_dir, manifest)
     debug_logger.info("received_initial_actor_step=%d", int(init_message.actor_params["step"]))
     actor_state = _trainer.apply_actor_params(actor_state, init_message.actor_params)
-    transition_sink = lambda item: _queue_transition(sample_queue, item, transition_recorder=transition_recorder)
+    transition_sink = lambda item: _queue_transition(learner_runtime, item, transition_recorder=transition_recorder)
 
     observation = initial_observation
     metrics: list[dict[str, float]] = []
@@ -958,8 +710,12 @@ def main(args: Args) -> None:
 
     try:
         while current_step < args.max_env_steps:
-            _check_learner_status(status_queue)
-            actor_state = _drain_policy_updates(policy_queue, actor_state, sync_logger=debug_logger)
+            learner_runtime.check_status()
+            actor_state = learner_runtime.sync_policy_state(
+                actor_state,
+                apply_actor_params=_trainer.apply_actor_params,
+                sync_logger=debug_logger,
+            )
 
             if current_step in state_history:
                 state = state_history[current_step]
@@ -1243,24 +999,20 @@ def main(args: Args) -> None:
                 terminal_state=final_state,
             )
 
-        graceful_stop_sent = _shutdown_learner(
-            learner_process,
-            sample_queue,
+        graceful_stop_sent = learner_runtime.shutdown(
             final_step=max(current_step - 1, 0),
             graceful_stop_sent=graceful_stop_sent,
         )
-        _check_learner_status(status_queue)
-        if learner_process.exitcode not in (0, None):
-            raise RuntimeError(f"Learner process exited with code {learner_process.exitcode}")
+        learner_runtime.check_status()
+        if learner_runtime.exitcode not in (0, None):
+            raise RuntimeError(f"Learner process exited with code {learner_runtime.exitcode}")
     finally:
         final_step = max(current_step - 1, 0)
         if transition_recorder is not None:
             transition_recorder.close()
             _repro.save_stop_signal(repro_dir, final_step)
         env.close()
-        graceful_stop_sent = _shutdown_learner(
-            learner_process,
-            sample_queue,
+        graceful_stop_sent = learner_runtime.shutdown(
             final_step=final_step,
             graceful_stop_sent=graceful_stop_sent,
         )

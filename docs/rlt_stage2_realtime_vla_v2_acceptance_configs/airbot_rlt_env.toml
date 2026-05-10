@@ -1,0 +1,66 @@
+prompt = "do the task"
+control_hz = 25
+max_episode_steps = 500
+display_images = true
+fake_env = false
+enable_intervention = true
+terminate_on_success_reward = false
+post_reset_sleep_sec = 0.2
+
+[keyboard]
+intervention_toggle_key = "s"
+reward_key = "y"
+terminate_episode_key = "n"
+abort_key = "esc"
+key_debounce_sec = 0.2
+
+[left_arm]
+name = "left"
+follower_port = 50051
+leader_port = 50050
+reset_joint_pos = [-0.3736, -0.8108, 0.6645, 1.4765, -0.8911, -1.3767, 0.0]
+gripper_max_length = 0.07
+gripper_sleep_sec = 0.6
+speed_fast = false
+
+[right_arm]
+name = "right"
+follower_port = 50053
+leader_port = 50052
+reset_joint_pos = [0.3809, -0.8669, 0.7577, -1.5047, 0.9221, 1.6538, 0.0]
+gripper_max_length = 0.07
+gripper_sleep_sec = 0.6
+speed_fast = false
+
+[cameras.cam_high]
+index = 4
+width = 640
+height = 480
+fps = 30
+crop_left = 0
+crop_right = 0
+crop_top = 0
+crop_bottom = 0
+fake = false
+
+[cameras.cam_left_wrist]
+index = 2
+width = 640
+height = 480
+fps = 30
+crop_left = 0
+crop_right = 0
+crop_top = 0
+crop_bottom = 0
+fake = false
+
+[cameras.cam_right_wrist]
+index = 0
+width = 640
+height = 480
+fps = 30
+crop_left = 0
+crop_right = 0
+crop_top = 0
+crop_bottom = 0
+fake = false

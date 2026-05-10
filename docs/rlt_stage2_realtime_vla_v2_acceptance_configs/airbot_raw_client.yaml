@@ -1,0 +1,105 @@
+client:
+  infer_url: "${RTVLA_FEATURE_SERVER_URL}"
+  endpoint: "/infer"
+  timeout_s: 5.0
+  run_duration_s: 300.0
+
+observer:
+  name: "airbot_real"
+  image_size: [640, 480]
+  fps: 30
+  state_dim: 14
+  airbot_host: "${AIRBOT_HOST}"
+  airbot_left_port: "${AIRBOT_LEFT_PORT}"
+  airbot_right_port: "${AIRBOT_RIGHT_PORT}"
+  top_camera_id: "cam_high"
+  left_camera_id: "cam_left_wrist"
+  right_camera_id: "cam_right_wrist"
+  enable_cameras: true
+  airbot_rlt_config_path: "docs/rlt_stage2_realtime_vla_v2_acceptance_configs/airbot_rlt_env.toml"
+
+executor:
+  name: "raw_action"
+  enable_init_action: true
+  init_action: [-0.3736, -0.8108, 0.6645, 1.4765, -0.8911, -1.3767, 0.0, 0.3809, -0.8669, 0.7577, -1.5047, 0.9221, 1.6538, 0.0]
+  init_steps: 100
+  init_sleep_s: 0.01
+  control_dt_s: 0.04
+  obs_image_delay_ms: 55.0
+  state_delay_s: 0.05
+  max_prefill_states: 15
+  heartbeat_history_len: 200
+  planner_dims: []
+  airbot_host: "${AIRBOT_HOST}"
+  airbot_left_port: "${AIRBOT_LEFT_PORT}"
+  airbot_right_port: "${AIRBOT_RIGHT_PORT}"
+  left_gripper_bias: 0.0
+  right_gripper_bias: 0.0
+  infer_fixed_dims: []
+  infer_fixed_values: []
+  command_fixed_dims: []
+  command_fixed_values: []
+  action_interval_ms: 40.0
+  action_speed_limit_per_s: 0.0
+  action_speed_limit_dims: [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+  enable_servo_interpolation: false
+  servo_interval_ms: 40.0
+  savgol_window_length: 1
+  savgol_polyorder: 3
+  forward_track_alpha: 1.0
+  forward_track_delay_cnt: 5
+  forward_track_lead_s: 0.15
+
+visualization:
+  output_dir: "${RLT_ACCEPTANCE_DIR}/airbot_raw_visualization"
+  enable_recording: true
+  record_videos: true
+  record_rerun: true
+  max_pending_video_frames: 32
+
+feedback:
+  name: "keyboard"
+  enable_leader_override: true
+  left_leader_port: 50050
+  right_leader_port: 50052
+  intervention_toggle_key: "s"
+  reward_key: "y"
+  terminate_episode_key: "n"
+  abort_key: "esc"
+  key_debounce_sec: 0.2
+
+rlt:
+  service:
+    feature_server_url: "${RTVLA_FEATURE_SERVER_URL}"
+    infer_endpoint: "/rlt/infer"
+    token_endpoint: "/rlt/token"
+    status_endpoint: "/rlt/status"
+    timeout_s: 30.0
+  observation:
+    prompt: "${RLT_PROMPT}"
+    velocity_source: "sdk"
+    diffusion_steps: 10
+    reference_horizon: 50
+    action_horizon: 10
+    chunk_stride: 2
+    vla_replan_horizon_scale: 1
+    discount: 1.0
+  learner:
+    config_name: "${RLT_TRAIN_CONFIG}"
+    init_checkpoint_dir: "${RLT_STAGE1_CHECKPOINT}"
+    checkpoint_dir: "${RLT_ACCEPTANCE_DIR}/airbot_raw_checkpoint"
+    overwrite: true
+    resume: false
+    record_repro: true
+    repro_shard_size: 64
+    replay_capacity: 100000
+    batch_size: 256
+    warmup_steps: 1000
+    utd_ratio: 5
+    actor_lr: 0.0003
+    critic_lr: 0.0003
+    save_interval: 1000
+    log_interval: 100
+    seed: 0
+    sample_queue_size: 1280
+    policy_queue_size: 1

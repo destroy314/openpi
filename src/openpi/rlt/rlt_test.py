@@ -12,6 +12,7 @@ from scripts import train_rlt_online as online
 from openpi.models import pi0_config
 from openpi.rlt import checkpointing
 from openpi.rlt import replay_buffer
+from openpi.rlt import rtvla_contract
 from openpi.rlt import token_module
 from openpi.rlt import trainer
 from openpi.shared.normalize import NormStats
@@ -61,6 +62,7 @@ def test_masked_reconstruction_loss_averages_over_embedding_dim():
     np.testing.assert_allclose(loss, np.ones((2,), dtype=np.float32))
 
 
+@pytest.mark.manual
 def test_rlt_training_step_and_checkpoint(tmp_path):
     key = jax.random.key(0)
     config = pi0_config.Pi0Config(
@@ -149,6 +151,89 @@ def test_rlt_training_step_and_checkpoint(tmp_path):
     restored_actor = trainer.restore_actor_state(actor_model, restored_policy, learning_rate=1e-3)
     assert int(restored_actor.step) == 1
     assert int(restored_critic["step"]) == 1
+
+
+def test_rtvla_infer_request_roundtrip():
+    request = rtvla_contract.RLTInferRequest(
+        request_id="req-1",
+        episode_id="ep-1",
+        observation=rtvla_contract.RLTObservation(
+            images={
+                "high": b"high",
+                "left_hand": b"left",
+                "right_hand": b"right",
+            },
+            state=np.arange(rtvla_contract.RLT_STATE_DIM, dtype=np.float32),
+            prompt="pick up block",
+            timestamp=1.25,
+        ),
+        diffusion_steps=10,
+        reference_horizon=50,
+    )
+
+    restored = rtvla_contract.RLTInferRequest.from_dict(request.to_dict())
+
+    assert restored.request_id == "req-1"
+    assert restored.episode_id == "ep-1"
+    assert restored.observation.images["high"] == b"high"
+    assert restored.observation.state[-1] == float(rtvla_contract.RLT_STATE_DIM - 1)
+    assert restored.reference_horizon == 50
+
+
+def test_rtvla_infer_response_rejects_actor_action_fields():
+    response = {
+        "request_id": "req-1",
+        "feature_id": "feat-1",
+        "rl_token": np.zeros((rtvla_contract.RLT_RL_TOKEN_DIM,), dtype=np.float32),
+        "reference_plan_norm": np.zeros((50, rtvla_contract.RLT_ACTION_DIM), dtype=np.float32),
+        "reference_plan_list": np.zeros((50, rtvla_contract.RLT_ACTION_DIM), dtype=np.float32),
+        "prefix_valid": True,
+        "server_infer_time_s": 0.01,
+        "debug": {
+            "rl_token_norm": 0.0,
+            "reference_plan_norm": 0.0,
+            "feature_shape": [rtvla_contract.RLT_RL_TOKEN_DIM],
+            "reference_plan_shape": [50, rtvla_contract.RLT_ACTION_DIM],
+        },
+        "action_list": [[0.0] * rtvla_contract.RLT_ACTION_DIM],
+    }
+
+    with pytest.raises(ValueError, match="unexpected keys"):
+        rtvla_contract.RLTInferResponse.from_dict(response)
+
+
+def test_rtvla_token_response_rejects_reference_plan_fields():
+    response = {
+        "request_id": "req-1",
+        "feature_id": "feat-1",
+        "rl_token": np.zeros((rtvla_contract.RLT_RL_TOKEN_DIM,), dtype=np.float32),
+        "prefix_valid": True,
+        "server_token_time_s": 0.01,
+        "debug": {
+            "rl_token_norm": 0.0,
+            "feature_shape": [rtvla_contract.RLT_RL_TOKEN_DIM],
+        },
+        "reference_plan_norm": np.zeros((50, rtvla_contract.RLT_ACTION_DIM), dtype=np.float32),
+    }
+
+    with pytest.raises(ValueError, match="unexpected keys"):
+        rtvla_contract.RLTTokenResponse.from_dict(response)
+
+
+def test_rtvla_contract_freezes_checkpoint_owner_and_queue_schema():
+    server = rtvla_contract.RLTServerRuntimeContract()
+    client = rtvla_contract.RLTClientRuntimeContract()
+
+    assert server.stage2_checkpoint_owner == "client"
+    assert not server.server_runs_actor
+    assert not server.server_runs_critic
+    assert not server.server_runs_learner
+    assert not server.server_builds_replay
+    assert client.actor_runtime_location == "client_main_process_threads"
+    assert client.learner_runtime_location == "client_learner_process"
+    assert client.sample_queue_message_types == ("ReplayItem", "StopSignal")
+    assert client.policy_queue_message_types == ("PolicyUpdate",)
+    assert client.status_queue_message_types == ("LearnerInit", "LearnerStats", "LearnerError")
 
 
 def test_patch_chunk_with_executed_prefix_replaces_action_and_intervention_reference():

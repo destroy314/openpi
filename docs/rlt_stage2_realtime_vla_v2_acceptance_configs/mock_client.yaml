@@ -1,0 +1,74 @@
+client:
+  infer_url: "${RTVLA_FEATURE_SERVER_URL}"
+  endpoint: "/infer"
+  timeout_s: 5.0
+  run_duration_s: 60.0
+
+observer:
+  name: "mock"
+  image_size: [224, 224]
+  fps: 30
+  state_dim: 14
+  airbot_host: "localhost"
+  airbot_left_port: 50051
+  airbot_right_port: 50053
+  top_camera_id: "mock_top"
+  left_camera_id: "mock_left"
+  right_camera_id: "mock_right"
+  enable_cameras: false
+
+executor:
+  name: "raw_action"
+  control_dt_s: 0.001
+  infer_fixed_dims: []
+  infer_fixed_values: []
+  command_fixed_dims: []
+  command_fixed_values: []
+  action_interval_ms: 1.0
+  enable_servo_interpolation: false
+
+visualization:
+  output_dir: "${RLT_ACCEPTANCE_DIR}/mock_visualization"
+  enable_recording: false
+  record_videos: false
+  record_rerun: false
+  max_pending_video_frames: 8
+
+feedback:
+  name: "noop"
+
+rlt:
+  service:
+    feature_server_url: "${RTVLA_FEATURE_SERVER_URL}"
+    infer_endpoint: "/rlt/infer"
+    token_endpoint: "/rlt/token"
+    status_endpoint: "/rlt/status"
+    timeout_s: 30.0
+  observation:
+    prompt: "${RLT_PROMPT}"
+    velocity_source: "sdk"
+    diffusion_steps: 10
+    reference_horizon: 50
+    action_horizon: 10
+    chunk_stride: 10
+    vla_replan_horizon_scale: 1
+    discount: 1.0
+  learner:
+    config_name: "${RLT_TRAIN_CONFIG}"
+    init_checkpoint_dir: "${RLT_STAGE1_CHECKPOINT}"
+    checkpoint_dir: "${RLT_ACCEPTANCE_DIR}/mock_client_checkpoint"
+    overwrite: true
+    resume: false
+    record_repro: true
+    repro_shard_size: 128
+    replay_capacity: 1024
+    batch_size: 1
+    warmup_steps: 0
+    utd_ratio: 1
+    actor_lr: 0.0003
+    critic_lr: 0.0003
+    save_interval: 10
+    log_interval: 1
+    seed: 0
+    sample_queue_size: 128
+    policy_queue_size: 1

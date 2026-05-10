@@ -198,3 +198,49 @@ def iter_transition_dicts(repro_dir: pathlib.Path | str):
                     "done": bool(shard["done"][index]),
                     "env_step": int(shard["env_step"][index]),
                 }
+
+
+class ExecutionRecordRecorder:
+    def __init__(self, repro_dir: pathlib.Path | str) -> None:
+        self._path = pathlib.Path(repro_dir) / "execution_records.jsonl"
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self._path.open("a", encoding="utf-8")
+
+    @property
+    def path(self) -> pathlib.Path:
+        return self._path
+
+    def add_chunk(
+        self,
+        *,
+        episode_id: str,
+        env_step: int,
+        action_sources: list[str],
+        records: list[dict[str, Any]],
+        feature_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "episode_id": episode_id,
+            "env_step": int(env_step),
+            "action_sources": list(action_sources),
+            "records": records,
+        }
+        if feature_metadata is not None:
+            payload["feature_metadata"] = feature_metadata
+        self._handle.write(json.dumps(_to_jsonable(payload), sort_keys=True) + "\n")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+def iter_execution_record_chunks(repro_dir: pathlib.Path | str):
+    path = pathlib.Path(repro_dir) / "execution_records.jsonl"
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                yield json.loads(line)

@@ -22,6 +22,7 @@ dependencies = [
     "numpy>=1.22.4,<2.0.0",
     "numpydantic>=1.6.6",
     "opencv-python>=4.10.0.84",
+    "osqp>=0.6.7.post3",
     "openpi-client",
     "orbax-checkpoint==0.11.13",
     "pillow>=11.0.0",
@@ -82,6 +83,9 @@ members = ["packages/*"]
 line-length = 120
 target-version = "py311"
 extend-exclude = ["docker", "third_party", "src/openpi/models_pytorch/transformers_replace/*"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openpi", "src/rt_vla"]
 
 [tool.ruff.lint]
 # https://docs.astral.sh/ruff/rules/
